@@ -1,0 +1,108 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# g36-filetransfer on|off|status
+# File transfer with a computer over USB (MTP), alongside ADB. The handheld keeps
+# using both partitions while it's on: files go through the handheld, not around it.
+#   on      make G36-EMU writable, switch USB to ADB + MTP
+#   off     switch USB back to ADB only, make G36-EMU read-only again
+#   refresh set USB up again for the current choices (Settings > USB debugging changed)
+#   status  "on" or "off"
+#
+# USB debugging (ADB) is on only if g36/settings.cfg says usb_debugging = 1; with it off, "off"
+# leaves USB with nothing on it, and "on" brings up MTP alone.
+#
+
+FLAG=/tmp/g36-filetransfer
+LOG=/var/log/g36-filetransfer.log
+GADGET=/sys/kernel/config/usb_gadget/rockchip
+
+log() {
+	echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $LOG
+}
+
+# Switch the USB functions to $1 (e.g. "adb mtp"). The factory "usbdevice restart"
+# neither starts the new functions' daemons nor stops the old ones, so do a full
+# stop with the current functions, then a start with the new ones.
+switch_usb() {
+	/usr/bin/usbdevice stop
+	for f in $1; do
+		echo "usb_${f}_en"
+	done > /tmp/.usb_config
+	/usr/bin/usbdevice start
+}
+
+adb_wanted() {
+	grep -q '^usb_debugging *= *1' /mnt/sdcard/g36/settings.cfg 2>/dev/null
+}
+
+# the functions the choices call for now: "adb", "mtp", both, or nothing
+wanted_funcs() {
+	f=
+	adb_wanted && f="adb"
+	[ -e $FLAG ] && f="$f mtp"
+	echo $f
+}
+
+# set USB up for the functions wanted now (stopping it when there are none)
+apply_usb() {
+	f=$(wanted_funcs)
+	if [ -z "$f" ]; then
+		/usr/bin/usbdevice stop
+		rm -f /tmp/.usb_config
+	else
+		switch_usb "$f"
+	fi
+}
+
+# the MTP server is up and USB is connected to the controller again
+ready() {
+	pidof umtprd >/dev/null && [ -n "$(cat $GADGET/UDC 2>/dev/null)" ]
+}
+
+case "$1" in
+	on)
+		log "file transfer on"
+		mount -o remount,rw /mnt/emu || log "could not make G36-EMU writable"
+		touch $FLAG
+		apply_usb
+		i=0
+		while ! ready && [ $i -lt 100 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		if ready; then
+			log "umtprd running"
+		else
+			# go back to how USB was before (ADB only, or nothing)
+			log "file transfer didn't start; back to ADB only"
+			exec "$0" off
+		fi
+		;;
+	off)
+		log "file transfer off"
+		rm -f $FLAG
+		apply_usb
+		i=0
+		while pidof umtprd >/dev/null && [ $i -lt 50 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		# make sure it's gone and stays gone (usbdevice respawns it while its tag exists)
+		rm -f /var/run/.usb_umtprd
+		killall -9 umtprd 2>/dev/null
+		sync
+		mount -o remount,ro /mnt/emu || log "could not make G36-EMU read-only"
+		;;
+	refresh)
+		log "refresh (usb debugging $(adb_wanted && echo on || echo off))"
+		apply_usb
+		;;
+	status)
+		[ -e $FLAG ] && echo on || echo off
+		;;
+	*)
+		echo "usage: $0 on|off|refresh|status" >&2
+		exit 2
+		;;
+esac

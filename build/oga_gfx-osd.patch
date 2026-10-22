@@ -1,0 +1,225 @@
+--- oga_gfx.c.orig
++++ oga_gfx.c
+@@ -39,6 +39,7 @@
+ #include "frontend/frontend_driver.h"
+ 
+ #include "../font_driver.h"
++#include <unistd.h>
+ 
+ #include "../../configuration.h"
+ #include "../../retroarch.h"
+@@ -103,7 +104,11 @@
+    uint32_t connector_id;
+    float display_ar;
+    bool threaded;
+-   char last_msg[128];
++   char last_msg[256];
++   /* G36: a message from another program (g36d), written to /tmp/g36-osd as "frames:text" */
++   char osd_msg[96];
++   unsigned osd_tick;
++   unsigned osd_left;
+ } oga_video_t;
+ 
+ static bool oga_create_display(oga_video_t* vid)
+@@ -443,10 +448,9 @@
+ {
+    const struct font_atlas* atlas;
+    uint32_t* fb;
+-   const char *c    = msg;
+-   int dest_x       = 0;
+-   int dest_y       = 0;
+-   int dest_stride;
++   const char *c;
++   const struct font_glyph* ga;
++   int line_h, block_w = 0, dest_y = 0, dest_stride;
+ 
+    if (msg[0] == '\0')
+       return false;
+@@ -454,7 +458,7 @@
+    if (strcmp(msg, vid->last_msg) == 0)
+       return true;
+ 
+-   strlcpy(vid->last_msg, c, sizeof(vid->last_msg));
++   strlcpy(vid->last_msg, msg, sizeof(vid->last_msg));
+    rga_clear_surface(vid->msg_surface, 0);
+ 
+    atlas          = vid->font_driver->get_atlas(vid->font);
+@@ -462,50 +466,93 @@
+    dest_stride    = vid->msg_surface->pitch / 4;
+    vid->msg_width = vid->msg_height = 0;
+ 
+-   while (*c)
++   ga = vid->font_driver->get_glyph(vid->font, 'A');
++   if (!ga)
++      return false;
++   line_h = ga->height;
++
++   /* G36: the block sits against the right edge of the screen, so each line is
++    * right-aligned inside it (a longer line must not push the others over).
++    * First pass: the width of the widest line. */
+    {
+-      int x, y;
+-      uint32_t* dest             = NULL;
+-      const uint8_t *source      = NULL;
+-      const struct font_glyph* g = vid->font_driver->get_glyph(vid->font, *c);
+-
+-      if (!g)
+-         continue;
+-
+-      if (vid->msg_height == 0)
+-         vid->msg_height = g->height;
++      int w = 0;
++      for (c = msg; ; c++)
++      {
++         if (*c == '\n' || *c == '\0')
++         {
++            if (w > block_w)
++               block_w = w;
++            w = 0;
++            if (*c == '\0')
++               break;
++            continue;
++         }
++         {
++            const struct font_glyph* g = vid->font_driver->get_glyph(vid->font, *c);
++            if (g)
++               w += g->advance_x;
++         }
++      }
++      if (block_w > vid->msg_surface->width)
++         block_w = vid->msg_surface->width;
++   }
+ 
+-      if (dest_x >= vid->drm_width)
++   /* second pass: draw */
++   c = msg;
++   while (*c)
++   {
++      const char *eol = c;
++      int line_w = 0, dest_x;
++
++      while (*eol && *eol != '\n')
+       {
+-         dest_x = 0;
+-         dest_y += g->height;
+-         vid->msg_height += g->height;
++         const struct font_glyph* g = vid->font_driver->get_glyph(vid->font, *eol);
++         if (g)
++            line_w += g->advance_x;
++         eol++;
+       }
++      dest_x = block_w - line_w;
++      if (dest_x < 0)
++         dest_x = 0;
+ 
+-      source = atlas->buffer + g->atlas_offset_y *
+-         atlas->width  + g->atlas_offset_x;
+-      dest   = fb + dest_y * dest_stride + dest_x;
+-
+-      for (y = 0; y < g->height; y++)
++      for (; c < eol; c++)
+       {
+-         for (x = 0; x < g->advance_x; x++)
+-         {
+-            uint32_t px = (x < g->width) ? *(source++) : 0x00;
+-            *(dest++)   = (0xCD << 24) | (px << 16) | (px << 8) | px;
++         int x, y;
++         const struct font_glyph* g = vid->font_driver->get_glyph(vid->font, *c);
++         uint32_t* dest;
++         const uint8_t *source;
++
++         if (!g)
++            continue;
++         if (dest_x + g->advance_x > vid->msg_surface->width
++               || dest_y + g->height > vid->msg_surface->height)
++            break;
++
++         source = atlas->buffer + g->atlas_offset_y * atlas->width + g->atlas_offset_x;
++         dest   = fb + dest_y * dest_stride + dest_x;
++
++         for (y = 0; y < g->height; y++)
++         {
++            for (x = 0; x < g->advance_x; x++)
++            {
++               uint32_t px = (x < g->width) ? *(source++) : 0x00;
++               *(dest++)   = (0xCD << 24) | (px << 16) | (px << 8) | px;
++            }
++            dest   += dest_stride - g->advance_x;
++            source += atlas->width - g->width;
+          }
+-         dest   += dest_stride - g->advance_x;
+-         source += atlas->width - g->width;
++         dest_x += g->advance_x;
+       }
+ 
+-      c++;
+-      dest_x += g->advance_x;
+-
+-      if (vid->msg_width < dest_x)
+-         vid->msg_width = MIN(dest_x, vid->msg_surface->width);
++      c = eol;
++      if (*c == '\n')
++         c++;
++      dest_y += line_h;
+    }
+ 
+-
+-   return true;
++   vid->msg_width  = block_w;
++   vid->msg_height = dest_y;
++   return vid->msg_width > 0;
+ }
+ 
+ static void oga_blit(oga_surface_t* src, int sx, int sy, int sw, int sh,
+@@ -567,8 +614,51 @@
+    {
+       if (frame_count % 4 != 0)
+          return true;
++   }
++
++   /* G36: pick up a message from /tmp/g36-osd a few times a second and show it under the
++    * normal on-screen text (the fps counter) for the number of frames it asks for */
++   if ((++vid->osd_tick & 7) == 0 && access("/tmp/g36-osd", F_OK) == 0)
++   {
++      char buf[sizeof(vid->osd_msg)];
++      FILE *f = fopen("/tmp/g36-osd", "r");
++      size_t n = 0;
++      if (f)
++      {
++         n = fread(buf, 1, sizeof(buf) - 1, f);
++         fclose(f);
++      }
++      unlink("/tmp/g36-osd");
++      while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
++         n--;
++      buf[n] = '\0';
++      if (n)
++      {
++         char *text = buf;
++         unsigned frames = (unsigned)strtoul(buf, &text, 10);
++         if (*text == ':')
++            text++;
++         else
++         {
++            text   = buf;
++            frames = 150;
++         }
++         strlcpy(vid->osd_msg, text, sizeof(vid->osd_msg));
++         vid->osd_left = frames;
++      }
+    }
+ 
++   if (vid->osd_left && vid->osd_msg[0])
++   {
++      static char both[256];
++      vid->osd_left--;
++      if (msg && msg[0])
++         snprintf(both, sizeof(both), "%s\n%s", msg, vid->osd_msg);
++      else
++         strlcpy(both, vid->osd_msg, sizeof(both));
++      msg = both;
++   }
++
+    if (msg && vid->font)
+    {
+         if (!render_msg(vid, msg))

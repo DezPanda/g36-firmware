@@ -1,0 +1,19 @@
+--- Makefile.common.orig	2026-10-08 20:52:34
++++ Makefile.common	2026-10-08 20:52:34
+@@ -2765,12 +2765,11 @@
+ endif
+ 
+ ifeq ($(HAVE_ODROIDGO2), 1)
++  # G36: the oga video driver only needs librga + libdrm. libgo2 (EGL/GBM) is
++  # for the GL context, and this board has no GPU.
+   DEFINES += -DHAVE_ODROIDGO2
+-  LIBS += -lrga -lpng -lz
+-  INCLUDE_DIRS += -I$(DEPS_DIR)/libgo2/include
+-  OBJ += $(DEPS_DIR)/libgo2/src/display.o \
+-         $(DEPS_DIR)/libgo2/src/queue.o \
+-         gfx/drivers/oga_gfx.o
++  LIBS += -lrga -ldrm
++  OBJ += gfx/drivers/oga_gfx.o
+ endif
+ 
+ ifeq ($(HAVE_GAME_AI),1)

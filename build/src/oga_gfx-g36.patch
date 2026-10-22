@@ -1,0 +1,79 @@
+--- oga_gfx.c.orig	2026-10-08 21:18:46
++++ oga_gfx.c	2026-10-08 21:28:15
+@@ -44,6 +44,11 @@
+ #include "../../retroarch.h"
+ #include "../../verbosity.h"
+ 
++/* G36 (RK3506): this RGA reads libretro RGB565 frames with red/blue swapped
++ * when tagged RK_FORMAT_RGB_565, so 16-bit frames are tagged BGR_565 instead. */
++#define OGA_FMT_565 RK_FORMAT_BGR_565
++#define OGA_FMT_32  RK_FORMAT_BGRA_8888
++
+ #define likely(x)   __builtin_expect(!!(x), 1)
+ #define unlikely(x) __builtin_expect(!!(x), 0)
+ 
+@@ -213,7 +218,7 @@
+ 
+    args.width  = width;
+    args.height = height;
+-   args.bpp    = rk_format == RK_FORMAT_BGRA_8888 ? 32 : 16;
++   args.bpp    = (rk_format == RK_FORMAT_BGRA_8888 || rk_format == RK_FORMAT_RGBA_8888) ? 32 : 16;
+    args.flags  = 0;
+ 
+    if (drmIoctl(display_fd, DRM_IOCTL_MODE_CREATE_DUMB, &args) < 0)
+@@ -282,7 +287,7 @@
+    ret               = drmModeAddFB2(surface->display_fd,
+          surface->width,
+          surface->height,
+-         surface->rk_format == RK_FORMAT_BGRA_8888
++         surface->pitch == surface->width * 4
+          ? DRM_FORMAT_ARGB8888
+          : DRM_FORMAT_RGB565,
+          handles,
+@@ -381,7 +386,7 @@
+    vid->drm_width = vid->mode.vdisplay;
+    vid->drm_height = vid->mode.hdisplay;
+ 
+-   vid->menu_surface = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, RK_FORMAT_BGRA_8888);
++   vid->menu_surface = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, OGA_FMT_32);
+    vid->threaded = video->is_threaded;
+ 
+    /*
+@@ -395,8 +400,8 @@
+    vid->scale_mode = video->ctx_scaling << 1 | video->smooth;
+    vid->rotation = 0;
+ 
+-   vid->frame_surface = oga_create_surface(vid->fd, geom->max_width, geom->max_height, video->rgb32 ? RK_FORMAT_BGRA_8888 : RK_FORMAT_RGB_565);
+-   vid->msg_surface   = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, RK_FORMAT_BGRA_8888);
++   vid->frame_surface = oga_create_surface(vid->fd, geom->max_width, geom->max_height, video->rgb32 ? OGA_FMT_32 : OGA_FMT_565);
++   vid->msg_surface   = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, OGA_FMT_32);
+    vid->last_msg[0]   = 0;
+ 
+    /* bitmap only for now */
+@@ -408,7 +413,7 @@
+ 
+    for (i = 0; i < NUM_PAGES; ++i)
+    {
+-      oga_surface_t* surface = oga_create_surface(vid->fd, vid->drm_height, vid->drm_width, RK_FORMAT_BGRA_8888);
++      oga_surface_t* surface = oga_create_surface(vid->fd, vid->drm_height, vid->drm_width, OGA_FMT_32);
+       vid->pages[i] = oga_create_framebuf(surface);
+       if (!vid->pages[i])
+          return NULL;
+@@ -648,7 +653,7 @@
+    {
+       oga_destroy_surface(vid->menu_surface);
+       vid->menu_surface = oga_create_surface(vid->fd, width, height,
+-            RK_FORMAT_BGRA_8888);
++            OGA_FMT_32);
+    }
+ 
+    /* The output pixel array with the converted pixels. */
+@@ -731,7 +736,7 @@
+    if (!vid)
+       return false;
+ 
+-   framebuffer->format = vid->frame_surface->rk_format == RK_FORMAT_BGRA_8888 ?
++   framebuffer->format = vid->frame_surface->pitch == vid->frame_surface->width * 4 ?
+       RETRO_PIXEL_FORMAT_XRGB8888 : RETRO_PIXEL_FORMAT_RGB565;
+    framebuffer->data = (uint8_t*)vid->frame_surface->map;
+    framebuffer->pitch = vid->frame_surface->pitch;

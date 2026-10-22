@@ -1,0 +1,27 @@
+FFmpeg for the G36 (LGPL build)
+===============================
+
+What the handheld's media player (g36menu) links is FFmpeg 4.4.4, built from the unmodified
+release tarball (https://ffmpeg.org/releases/ffmpeg-4.4.4.tar.xz) as shared libraries, under
+the GNU LGPL version 2.1 or later. It is built without any GPL or non-free part: no x264, no
+x265, no OpenSSL, no postproc, no network support. (The system's own FFmpeg that came with
+the handheld was built with --enable-gpl --enable-nonfree, which FFmpeg says can't be
+redistributed, so it isn't in the firmware.)
+
+The exact steps are in build-ffmpeg-lgpl.sh. The configure line is:
+
+  ./configure --prefix=/usr --enable-cross-compile --cross-prefix=armv7-unknown-linux-gnueabihf- \
+    --arch=arm --cpu=cortex-a7 --target-os=linux --enable-shared --disable-static --enable-pic \
+    --disable-gpl --disable-nonfree --disable-version3 --disable-autodetect \
+    --disable-programs --disable-doc --disable-avdevice --disable-postproc --disable-avresample \
+    --disable-network --disable-debug --disable-stripping --enable-neon --enable-vfp --enable-zlib \
+    --disable-armv5te --extra-cflags="-O3 -mfpu=neon-vfpv4 -mfloat-abi=hard -I<zlib headers>"
+
+  (--disable-armv5te: the old ARMv5 assembly files don't build with the cross toolchain's
+  assembler; the ARMv6 and NEON versions the Cortex-A7 uses are all there.)
+
+Libraries produced and installed in /usr/lib: libavutil.so.56.70.100, libswresample.so.3.9.100,
+libswscale.so.5.9.100, libavcodec.so.58.134.100, libavformat.so.58.76.100,
+libavfilter.so.7.110.100. They keep the versions and names the system's FFmpeg had, so
+programs built for it work unchanged. Replacing them: an LGPL library can be swapped for your
+own build of the same source the same way (copy over these files).
