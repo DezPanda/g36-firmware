@@ -1,0 +1,186 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# G36 storage: check and mount the two exFAT partitions before anything else runs.
+#   p4  G36-EMU    emulator cores, mounted read-only at /mnt/emu
+#   p5  G36-GAMES  roms, bios, saves, thumbnails, collections, settings, at /mnt/sdcard
+# On a freshly flashed card there is no p5 yet: create it in the free space after
+# p4, format it, and copy in the starter layout. A partition that already holds a
+# filesystem is never formatted, and neither is one that holds anything else: no
+# filesystem found is also what a damaged one (or a card that misread) looks like, so
+# only a partition made in this boot, or one that is empty through and through, is
+# formatted.
+#
+
+DISK=/dev/mmcblk0
+EMU=${DISK}p4
+GAMES=${DISK}p5
+SYS=/sys/block/mmcblk0
+LOG=/var/log/g36-storage.log
+TEMPLATE=/usr/share/g36/template
+BASIC_DATA=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
+
+log() {
+	echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $LOG
+}
+
+reboot_clean() {
+	log "rebooting: $*"
+	sync
+	mount -o remount,ro /
+	reboot -f
+}
+
+create_games() {
+	emu_start=$(cat $SYS/mmcblk0p4/start)
+	emu_size=$(cat $SYS/mmcblk0p4/size)
+	start=$(( (emu_start + emu_size + 2047) / 2048 * 2048 ))
+	last=$(( $(cat $SYS/size) - 34 ))
+	len=$(( last - start + 1 ))
+	if [ $len -lt 262144 ]; then
+		log "no room for a games partition (start $start, $len sectors)"
+		return 1
+	fi
+	log "creating games partition: start $start, $len sectors"
+	sfdisk --no-reread --relocate gpt-bak-std $DISK >> $LOG 2>&1
+	echo "start=$start, size=$len, type=$BASIC_DATA, name=G36-GAMES" | \
+		sfdisk --no-reread --append $DISK >> $LOG 2>&1 || return 1
+	sync
+	# tell the kernel about it now; fall back to a reboot if that isn't possible
+	g36-blkpg add $DISK 5 $start $len >> $LOG 2>&1 || reboot_clean "kernel didn't take the new partition"
+	i=0
+	while [ ! -b $GAMES ] && [ $i -lt 50 ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	[ -b $GAMES ] || reboot_clean "no device node for the new partition"
+}
+
+# Is the first MiB of $1 all zeros? A read that fails or comes up short is not "empty".
+blank() {
+	head=/tmp/g36-games-head
+	dd if="$1" of=$head bs=64k count=16 2>/dev/null || { rm -f $head; return 1; }
+	if [ "$(wc -c < $head)" -eq 1048576 ] && [ "$(tr -d '\000' < $head | wc -c)" -eq 0 ]; then
+		rm -f $head
+		return 0
+	fi
+	rm -f $head
+	return 1
+}
+
+format_games() {
+	log "formatting $GAMES as exFAT"
+	mkfs.exfat -c 32K -L G36-GAMES $GAMES >> $LOG 2>&1
+}
+
+# copy_new SRCDIR: every file under SRCDIR that isn't on the games drive yet, never over
+# what's there. Each is copied under a temporary name and renamed when whole, so a power
+# cut can't leave a half-copied file that then counts as present. 1 if any copy failed.
+copy_new() {
+	failed=0
+	(cd "$1" && find . -type f) > /tmp/g36-copy-list
+	while IFS= read -r f; do
+		[ -e "/mnt/sdcard/$f" ] && continue
+		mkdir -p "/mnt/sdcard/$(dirname "$f")"
+		if cp "$1/$f" "/mnt/sdcard/$f.part" && mv "/mnt/sdcard/$f.part" "/mnt/sdcard/$f"; then
+			:
+		else
+			rm -f "/mnt/sdcard/$f.part"
+			log "could not copy $f"
+			failed=1
+		fi
+	done < /tmp/g36-copy-list
+	rm -f /tmp/g36-copy-list
+	return $failed
+}
+
+populate() {
+	# starter files (never overwrite), then make sure every standard folder exists
+	copy_new $TEMPLATE
+	# larger starter files (the chatbot's and the image generator's models) are kept on the
+	# read-only emulators drive and copied over once: after that, deleting one keeps it
+	# deleted. (The marker stays if the games drive is kept when the card is flashed again.)
+	if [ -d /mnt/emu/starter ] && [ ! -e /mnt/sdcard/g36/.starter-copied ]; then
+		if copy_new /mnt/emu/starter; then
+			mkdir -p /mnt/sdcard/g36
+			: > /mnt/sdcard/g36/.starter-copied
+		fi
+	fi
+	for d in roms bios saves collections g36/logs thumbnails/ready thumbnails/to-resize thumbnails/resized; do
+		mkdir -p /mnt/sdcard/$d
+	done
+	sed -n 's/^\([a-z0-9-]*\) *|.*/\1/p' /mnt/sdcard/g36/systems.cfg 2>/dev/null | while read -r s; do
+		mkdir -p /mnt/sdcard/roms/$s
+	done
+}
+
+mount_emu() {
+	if [ -b $EMU ]; then
+		fsck.exfat -p $EMU >> $LOG 2>&1
+		mount -t exfat -o ro $EMU /mnt/emu >> $LOG 2>&1 || log "could not mount the emulators partition"
+	else
+		log "no emulators partition"
+	fi
+}
+
+mount_games() {
+	fsck.exfat -p $GAMES >> $LOG 2>&1
+	if mount -t exfat -o errors=remount-ro $GAMES /mnt/sdcard >> $LOG 2>&1; then
+		populate
+		cp $LOG /mnt/sdcard/g36/logs/storage.log 2>/dev/null
+	else
+		log "could not mount the games partition"
+	fi
+}
+
+start() {
+	: > $LOG
+	mkdir -p /mnt/emu /mnt/sdcard
+	mount_emu
+
+	created=0
+	if [ ! -b $GAMES ]; then
+		create_games && created=1
+	fi
+
+	if [ -b $GAMES ]; then
+		type=$(blkid -o value -s TYPE $GAMES 2>/dev/null)
+		if [ -z "$type" ]; then
+			if [ $created = 1 ] || blank $GAMES; then
+				format_games
+			else
+				log "games partition holds data but no filesystem I know; leaving it alone"
+			fi
+		elif [ "$type" != exfat ]; then
+			log "games partition holds $type, not exFAT; leaving it alone"
+		fi
+		mount_games
+	fi
+	sync
+}
+
+# after drive mode: check and mount both again; never creates or formats anything
+remount() {
+	log "remount"
+	mountpoint -q /mnt/emu || mount_emu
+	mountpoint -q /mnt/sdcard || { [ -b $GAMES ] && mount_games; }
+	sync
+}
+
+stop() {
+	sync
+	umount /mnt/sdcard 2>/dev/null
+	umount /mnt/emu 2>/dev/null
+}
+
+case "$1" in
+	start)
+		start
+		;;
+	stop)
+		stop
+		;;
+	remount)
+		remount
+		;;
+esac

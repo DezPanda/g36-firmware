@@ -1,0 +1,74 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# g36-drivemode on|off|status
+# Share the G36-GAMES and G36-EMU partitions with a computer over USB (ADB keeps
+# working alongside), and take them back afterwards.
+#   on      flush and unmount both partitions, then share them
+#   off     stop sharing, then check and remount both partitions
+#   status  "off", "on" (shared), or "ejected" (the computer ejected both drives)
+#
+
+GADGET=/sys/kernel/config/usb_gadget/rockchip/functions/mass_storage.0
+FLAG=/tmp/g36-drivemode
+LOG=/var/log/g36-drivemode.log
+
+log() {
+	echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $LOG
+}
+
+shared() {
+	[ "$(cat $GADGET/lun.0/file 2>/dev/null)" = /dev/mmcblk0p5 ]
+}
+
+case "$1" in
+	on)
+		log "drive mode on"
+		sync
+		if ! umount /mnt/sdcard; then
+			log "games partition busy; not starting"
+			exit 1
+		fi
+		umount /mnt/emu
+		touch $FLAG
+		printf 'usb_adb_en\nusb_ums_en\n' > /tmp/.usb_config
+		/usr/bin/usbdevice restart
+		i=0
+		while ! shared && [ $i -lt 100 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		if shared; then
+			log "shared"
+		else
+			log "sharing didn't start; taking the drives back"
+			exec "$0" off
+		fi
+		;;
+	off)
+		log "drive mode off"
+		rm -f $FLAG
+		printf 'usb_adb_en\n' > /tmp/.usb_config
+		/usr/bin/usbdevice restart
+		i=0
+		while [ -e $GADGET ] && [ $i -lt 100 ]; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		/etc/init.d/S05g36storage remount
+		log "remounted"
+		;;
+	status)
+		if [ ! -e $FLAG ]; then
+			echo off
+		elif [ -z "$(cat $GADGET/lun.0/file 2>/dev/null)" ] && [ -z "$(cat $GADGET/lun.1/file 2>/dev/null)" ]; then
+			echo ejected
+		else
+			echo on
+		fi
+		;;
+	*)
+		echo "usage: $0 on|off|status" >&2
+		exit 2
+		;;
+esac

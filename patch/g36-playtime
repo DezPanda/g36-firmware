@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# g36-playtime finish
+# Add the game session that just ended to g36/playtime.txt. The launcher notes the
+# start (seconds since boot, which needs no clock) and the game in /tmp/play-start;
+# this runs before the menu comes back and at shutdown (from g36-logs).
+# playtime.txt: one line per game, "<path inside roms/> = <seconds>".
+#
+
+START=/tmp/play-start
+FILE=/mnt/sdcard/g36/playtime.txt
+
+[ -f $START ] || exit 0
+read t0 key < $START
+rm -f $START
+[ -n "$key" ] || exit 0
+mountpoint -q /mnt/sdcard || exit 0
+
+now=$(cut -d' ' -f1 /proc/uptime)
+secs=$(awk -v a="$t0" -v b="$now" 'BEGIN { d = b - a; if (d < 0) d = 0; printf "%d", d }')
+# for the menu: a game that closed within seconds may not have started at all
+echo "$secs $key" > /tmp/last-session
+[ "$secs" -gt 0 ] || exit 0
+# a game that didn't start doesn't count (RetroArch logs how long content ran)
+[ "$secs" -ge 10 ] || grep -q "Content ran for a total" /tmp/ra-last.log 2>/dev/null || exit 0
+
+[ -s $FILE ] || echo "# Play time per game, in seconds (kept by the handheld)." > $FILE
+awk -v key="$key" -v add="$secs" '
+	/^#/ { print; next }
+	{
+		i = index($0, " = ")
+		if (i && substr($0, 1, i - 1) == key) {
+			printf "%s = %d\n", key, substr($0, i + 3) + add
+			done = 1
+		} else
+			print
+	}
+	END { if (!done) printf "%s = %d\n", key, add }' $FILE > $FILE.tmp && mv -f $FILE.tmp $FILE
+sync

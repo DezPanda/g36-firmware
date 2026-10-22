@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+# Start RetroArch 1.22 for the game the menu picked. The menu writes the core and
+# ROM to /tmp/game.cfg; remove it so the startup loop returns to the menu on exit.
+CFG=/tmp/game.cfg
+ROMS=/mnt/sdcard/roms
+SAVES=/mnt/sdcard/saves
+OVERRIDE=/tmp/ra-override.cfg
+core=$(sed -n "s/^core_path = \"\(.*\)\"$/\1/p" $CFG)
+rom=$(sed -n "s/^rom_path = \"\(.*\)\"$/\1/p" $CFG)
+rm -f $CFG
+
+# Tools row: RetroArch on its own, for setting things up by hand
+if [ -z "$core" ]; then
+	exec /usr/bin/retroarch-1.22 -c /oem/retroarch/retroarch-1.22.cfg --verbose --log-file=/tmp/ra-last.log
+fi
+
+# Play time: note when this game started (seconds since boot); g36-playtime adds it up
+echo "$(cut -d' ' -f1 /proc/uptime) ${rom#$ROMS/}" > /tmp/play-start
+
+# Saves and save states go to saves/<console>/, whichever subfolder the game is in.
+system=$(echo "$rom" | sed -n "s|^$ROMS/\([^/]*\)/.*|\1|p")
+: > $OVERRIDE
+if [ -n "$system" ]; then
+	mkdir -p "$SAVES/$system"
+	printf 'savefile_directory = "%s"\nsavestate_directory = "%s"\n' "$SAVES/$system" "$SAVES/$system" > $OVERRIDE
+fi
+# Closing a game writes a state beside its other saves ("<game>.state.auto", apart from the
+# manual save states). Only a start right after a sleep loads it: g36-sleep closes the game
+# with that, and the wake starts it again at the same moment.
+printf 'savestate_auto_save = "true"\n' >> $OVERRIDE
+if [ -f /tmp/sleep-wake ]; then
+	printf 'savestate_auto_load = "true"\n' >> $OVERRIDE
+	rm -f /tmp/sleep-wake
+	touch /tmp/ra-resumed   # this session is a resume: g36-logs checks afterwards that it ended cleanly
+	# say so on the game screen (the game picks the message up once it is running; the state loads at the same time)
+	printf '300:Sleep state loaded\n' > /tmp/g36-osd.tmp && mv -f /tmp/g36-osd.tmp /tmp/g36-osd
+else
+	rm -f /tmp/ra-resumed
+fi
+
+# zipped games that need a real file are unpacked here (RAM); clear the previous one
+rm -rf /tmp/ra-cache
+mkdir -p /tmp/ra-cache
+
+exec /usr/bin/retroarch-1.22 -c /oem/retroarch/retroarch-1.22.cfg --appendconfig=$OVERRIDE \
+	--verbose --log-file=/tmp/ra-last.log -L "$core" "$rom"

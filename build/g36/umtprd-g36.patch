@@ -1,0 +1,24 @@
+--- src/umtprd.c.orig	2026-10-09 23:09:04
++++ src/umtprd.c	2026-10-09 23:09:04
+@@ -28,6 +28,7 @@
+ #include <inttypes.h>
+ #include <stdlib.h>
+ #include <stdio.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <string.h>
+ #include <sys/prctl.h>
+@@ -152,7 +153,12 @@
+ 	fd = get_message_queue();
+ 	if (fd < 0)
+ 	{
+-		exit(1);
++		// G36: the kernel has no POSIX message queues; use a lock file to stay single-instance
++		fd = open("/var/run/umtprd.lock", O_RDWR | O_CREAT, 0600);
++		if (fd < 0)
++		{
++			exit(1);
++		}
+ 	}
+ 	retcode = flock(fd, LOCK_EX | LOCK_NB);
+ 	if (retcode)

@@ -1,0 +1,63 @@
+Player Limitations
+==================
+The Video Player plays what's in this folder, one folder per show or film
+(subfolders such as seasons are fine). Things to know before copying videos here:
+
+Size and format
+- The screen is 854x480, so 480p (H.264, MP4) is all it can show: it looks
+  as sharp as anything bigger, the files are small, and it is the easiest on the
+  battery. Use it when you're converting videos yourself.
+- 720p H.264 is tested to play at full speed, even at 2x speed. 1080p H.264
+  plays too (about 70% of the processor, against about half for 720p), but it
+  takes more space and battery and looks no sharper on this screen.
+- The chip has no video decoder, so videos are decoded in software. H.265
+  (HEVC), 4K and 60 fps videos may stutter or not play. Speeds above 1x are
+  smooth only for videos of 720p or less.
+- MP4, MKV, MOV, AVI, WebM, MPEG and TS files show up. Other files in this
+  folder (like this one) are ignored.
+
+Sound and subtitles
+- Press the Menu button while a video plays for the video options: subtitles
+  (on or off, which track, and their size), the sound track, speed (0.5x to 2x),
+  picture (fit, zoom or stretch), play next, a sleep timer, Sound only, and
+  start over. They are kept in g36/player.cfg.
+- If a file has several sound tracks (languages, commentary), choose one in
+  the options. Its subtitle tracks are there too, text or picture.
+- Subtitles can also be a file beside the video with the same name:
+  Episode.srt, or Episode.en.srt for a language (also .ass, .ssa and .vtt).
+  Several are fine; each is offered by name. Files saved as UTF-8, UTF-16 or
+  the usual Windows (Western European) encoding show their accents correctly.
+  Subtitles in other encodings (Russian, Greek, Japanese, Chinese ...) need
+  saving as UTF-8 first; a text editor's "Save as" does it.
+
+Sound only
+- "Sound only" in the options turns the screen off and plays on: the picture
+  isn't read or decoded at all, so a video you only want to listen to uses
+  very little battery. Press any button (or tap Power) to bring the picture
+  back where it is. It carries on through the folder (Play next); when the
+  folder is finished, the screen comes back on.
+- Tapping Power during a video turns the screen off and pauses it. Use Sound
+  only when you want the sound to carry on.
+
+Pictures
+- Each video's picture is a frame from about a quarter of the way in, made the
+  first time the folder is opened (the ones near your selection first). It shows
+  big on the right and small beside the video's name in the list, like the games'
+  pictures. They're kept in thumbnails/videos/, in the same folders and with the
+  same names as the videos. To use your own, replace
+  one with your image (JPG or PNG), keeping the name:
+  thumbnails/videos/American Dad/Pilot.jpg is the picture for
+  videos/American Dad/Pilot.mp4.
+
+Playing and watch progress
+- The videos in a folder play one after another, in the order they're listed
+  (name them so they sort: "S1 Ep 01", "S1 Ep 02" ...). L and R skip to the
+  previous or next one. Left and Right skip 10 seconds, Up and Down a minute.
+- Each folder remembers the video you're on and where you stopped in it, not
+  every video: opening the folder starts on that video, and any other video
+  starts from the beginning. Press X in the Video Player to reset it all.
+- Each folder's card shows a bar: "Watching 5/11 videos" (the video you're on,
+  out of all of them), then that video and how far into it you are. Folders
+  inside the folder, such as seasons, count in order. A folder you haven't
+  started just says how many videos it has; one watched to the end says
+  "Watched 11/11 videos" until you play it again.

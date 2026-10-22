@@ -1,0 +1,70 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# g36-logs save-launch|save-all
+# Keep the handheld's logs on the card (g36/logs/), where they survive a reboot and
+# can be read from a computer. Logs are written to RAM while things run and copied
+# here between games and at shutdown, so the card isn't written during play.
+#   save-launch  the last game's RetroArch log -> launch-1.log (keeps the last 5)
+#   save-all     the above, plus the menu and file-transfer logs (at shutdown)
+#
+
+DIR=/mnt/sdcard/g36/logs
+KEEP=5
+MAX=262144    # bytes kept from the end of each log
+
+mountpoint -q /mnt/sdcard || exit 0
+mkdir -p $DIR
+
+# the game that just ended counts towards its play time (before the menu reads it)
+/usr/sbin/g36-playtime finish
+
+# A game that was started from a sleep (g36-sleep's marker on the card) and ended cleanly needs no
+# "load the sleep state" offer any more. RetroArch prints "[Core] Unloading core" only when it quits
+# properly, so a crash, a hang or a power cut leaves the marker for the menu to offer.
+SLEEP_MARKER=/mnt/sdcard/g36/sleep-state.cfg
+check_sleep_marker() {
+	[ -f /tmp/ra-resumed ] || return 0
+	rm -f /tmp/ra-resumed
+	[ -f $SLEEP_MARKER ] && [ -f /tmp/ra-last.log ] && grep -q '\[Core\] Unloading core' /tmp/ra-last.log && rm -f $SLEEP_MARKER
+	return 0
+}
+
+save_launch() {
+	check_sleep_marker
+	[ -f /tmp/ra-last.log ] || return 0
+	i=$KEEP
+	while [ $i -gt 1 ]; do
+		[ -f $DIR/launch-$((i - 1)).log ] && mv -f $DIR/launch-$((i - 1)).log $DIR/launch-$i.log
+		i=$((i - 1))
+	done
+	tail -c $MAX /tmp/ra-last.log > $DIR/launch-1.log
+	# keep it in RAM for ADB, under a name that won't be saved twice
+	mv -f /tmp/ra-last.log /tmp/ra-prev.log
+}
+
+# $1 = log in RAM, $2 = name on the card; the previous boot's copy becomes <name>-prev.log
+save_copy() {
+	[ -f "$1" ] || return 0
+	if [ ! -f /tmp/g36-logs-$2 ]; then
+		[ -f $DIR/$2.log ] && mv -f $DIR/$2.log $DIR/$2-prev.log
+		touch /tmp/g36-logs-$2
+	fi
+	tail -c $MAX "$1" > $DIR/$2.log
+}
+
+case "$1" in
+	save-launch)
+		save_launch
+		;;
+	save-all)
+		save_launch
+		save_copy /tmp/g36menu.log menu
+		save_copy /var/log/g36-filetransfer.log filetransfer
+		;;
+	*)
+		echo "usage: $0 save-launch|save-all" >&2
+		exit 2
+		;;
+esac
+sync

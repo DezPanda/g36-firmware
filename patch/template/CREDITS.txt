@@ -1,0 +1,113 @@
+G36 front end: credits
+======================
+
+This card's menu and the programs written for it are made from the work of
+many other people. This is who they are and what they asked for in return.
+
+The programs written for this project (the menu, g36d, Get Artwork, the
+scripts and so on) are free software under the MIT licence, Copyright (c) 2026
+DezPanda: the text is in LICENSE.txt, and you may use, change and share them
+however you like. Everything else on the card is other people's work, under
+the terms below. Because some of it (the console logos and the arcade
+emulators) may not be sold, please don't sell this card or its image.
+
+HOW IT WAS MADE: most of the programs written for this project were written
+with AI (Anthropic's Claude), with DezPanda directing the work, making the
+decisions and testing every change on a real handheld. Mistakes are the
+project's own; please report them.
+
+
+CONSOLE LOGOS
+-------------
+The logos on the console cards (theme/logos/) are from the platform logo set
+by Dan Patrick (version 2.1, made for LaunchBox and BigBox, and first shared
+on the LaunchBox forum). Most are drawn by him by hand; some are rebuilt from
+official artwork. We use the "Normal" size, "Light - Color" versions.
+
+His terms, from the set's own Read Me: the logos can be used elsewhere; he
+will always appreciate credit if you use them; he doesn't own the rights to
+the logos themselves (they belong to the companies behind each console); and
+they are NEVER to be sold in any way.
+
+Changes made here: each logo was shrunk to fit its card (400 x 120 pixels)
+and nothing else was changed. Thank you, Dan.
+
+
+LETTERING
+---------
+Cards with no logo show their name in Montserrat (theme/fonts/), used under
+the SIL Open Font License; its text is in theme/fonts/OFL.txt.
+
+
+EMULATORS
+---------
+Games run in RetroArch 1.22.2 and the libretro emulator cores (stored on the
+G36-EMU drive): a5200, atari800, fba, fbalpha2012, fbneo, fceumm, fceunext,
+gambatte, gearsystem, genesis_plus_gx, gpsp, handy, mame2003, mame2003_plus,
+mame2010, mame2016, mednafen_ngp, mednafen_pce_fast, mednafen_pce, mgba,
+nekop2, neocd, pcsx_rearmed, prosystem, snes9x2010, snes9x, stella2014,
+stella. Each is the work of its own authors, under its own licence; the
+arcade cores in particular (FBNeo and the MAME family) are for
+non-commercial use only. Thank you to the libretro team and every core author.
+
+BIOS files and game ROMs are not part of this project and are not ours to
+give away; they are only on cards for their owner's own games.
+
+
+GAME PICTURES
+-------------
+The "Get Artwork" program on the card's drive finds box art for your games on
+thumbnails.libretro.com, the libretro thumbnails project (the libretro team and
+everyone who made and named those pictures). The pictures belong to their
+owners; none are included on this card. They are downloaded on your own
+computer, for your own games, only when you run the program. Get Artwork is
+our own program (MIT), written in Go; the Go standard library inside it is
+BSD-licensed (Copyright The Go Authors). For arcade games
+it turns file names such as "2020bb" into titles with a list taken from the
+FinalBurn Neo core (see EMULATORS; non-commercial use only).
+
+
+THE CHATBOT
+-----------
+A language model, run on the handheld with llama.cpp (Georgi Gerganov and contributors, MIT
+licence) and its ggml library: SmolLM2-135M-Instruct, by Hugging Face (the HuggingFaceTB
+team: Loubna Ben Allal, Anton Lozhkov, Elie Bakouch and colleagues; Apache 2.0). It is used
+as released, in its quantized (smaller) GGUF form. Its paper: "SmolLM2: When Smol Goes Big
+-- Data-Centric Training of a Small Language Model".
+
+
+THE IMAGE GENERATOR
+-------------------
+  - Supra2-IMG, by SupraLabs (Apache 2.0): the model that draws the pictures.
+  - Flan-T5-Base, by Google (Apache 2.0): reads the prompt. Only its encoder
+    half is used.
+  - TAESD, by Ollin Boer Bohan (madebyollin) (MIT): turns the result into a
+    picture, and the sharpening preview.
+The three are converted to 8-bit numbers to fit in the handheld's memory
+(imagegen/models/); the program that runs them (g36-imagegen) was written for
+this project, following Supra2-IMG's own reference code. The pictures it makes
+are yours.
+
+
+VIDEO AND MUSIC
+---------------
+Playback uses FFmpeg 4.4.4 (the FFmpeg developers; LGPL 2.1 or later, built for
+this firmware without any GPL or non-free parts), with the handheld's ALSA sound
+library. Picture scaling uses Rockchip's librga, text
+drawing uses FreeType, and images are read with stb_image (public domain).
+
+Subtitles can be made on a computer with OpenAI's Whisper, through whisper.cpp
+(MIT); the script for that is in the project's tools/ folder, not on the card.
+
+
+THE MENU'S TEXT
+---------------
+The menu, chatbot and image generator draw their text in Open Sans Semibold
+(Steve Matteson; Apache 2.0), the font the handheld's own firmware came with.
+
+
+THE HANDHELD ITSELF
+-------------------
+The handheld (sold as the "G36", built on a Rockchip RK3506B) runs Rockchip's
+reference Linux (Buildroot). File transfer over USB uses umtprd; the games
+drive is exFAT, made with exfatprogs. Thanks to all of those projects.

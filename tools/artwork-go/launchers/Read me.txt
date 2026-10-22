@@ -1,0 +1,30 @@
+GET ARTWORK
+===========
+
+Gets a picture for each game on your G36 and puts it where the G36 will find it.
+
+WHAT TO DO
+  1. Plug the G36 card into your computer (a card reader or the SD slot).
+  2. Double-click:
+       Windows:  Get Artwork - Windows.exe
+       Mac:      Get Artwork - Mac.command
+  3. Answer Y (or just press Enter) when it asks to download.
+  4. Put the card back in the G36 and turn it on. Give it a few minutes to turn
+     the pictures into thumbnails; they appear in the game lists by themselves.
+
+Your computer needs an internet connection; the G36 doesn't. Run it again whenever
+you add games: it only gets pictures for games that don't have one yet, and it
+remembers the games it couldn't find (it looks again after 60 days).
+
+WITHOUT TAKING THE CARD OUT
+  If the games are on your computer rather than the card, run it, and when it says it
+  can't find the card, drag the folder that has your games into the window (the one with
+  a folder for each system: gba, snes, ...). It makes a folder called "G36 Artwork"; copy
+  what's inside it to thumbnails/to-resize on the G36-GAMES drive (plug the G36 in with
+  File Transfer on, or use the card).
+
+If a picture is wrong or missing, put your own in thumbnails/to-resize/<system>/ named
+like the game file, e.g. thumbnails/to-resize/gba/Metroid Fusion.png (PNG or JPEG).
+
+The pictures come from the libretro thumbnails project, https://thumbnails.libretro.com .
+Command-line options (for the curious): run the program with --help.

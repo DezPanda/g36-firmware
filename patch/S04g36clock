@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+#
+# G36 clock: the handheld has no clock chip, so every boot would start at 1970.
+# g36d saves the time to /etc/g36-clock every 10 minutes and at shutdown; at boot
+# this sets the clock to that time, or to 1 Jan 2026 if that's later. The date then
+# never goes backwards; it only falls behind by however long the handheld was off.
+#
+
+SAVED=/etc/g36-clock
+FLOOR=1767225600    # 2026-01-01 00:00:00 UTC
+
+case "$1" in
+	start)
+		t=$(cat $SAVED 2>/dev/null)
+		case "$t" in
+			''|*[!0-9]*) t=0 ;;
+		esac
+		[ "$t" -lt $FLOOR ] && t=$FLOOR
+		now=$(date +%s)
+		[ "$now" -lt "$t" ] && date -u -s @$t >/dev/null
+		;;
+	save)
+		date +%s > $SAVED.tmp && sync && mv -f $SAVED.tmp $SAVED && sync
+		;;
+esac

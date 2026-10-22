@@ -1,0 +1,60 @@
+G36 firmware: source code and licences
+======================================
+
+The system on this card is made of free software, each part under its own licence.
+This file says where every part's source code is. Our own programs are MIT-licensed
+(LICENSE.txt); the rest keep their own licences. Please don't sell the card or its
+image (see CREDITS.txt: some parts may not be sold).
+
+OUR OWN PROGRAMS
+  The menu (g36menu: the home screen, game lists, Video and Music Players, settings),
+  g36d (power button, battery, clock, volume buttons), the Chatbot (g36-chat), the
+  Image Generator (g36-imagegen), g36-thumbs, g36-splash, g36-key, g36-blkpg, and the
+  storage, sleep and file-transfer scripts. The Get Artwork program on the card
+  (for a computer, not the handheld) is ours too: folder tools/artwork-go/ in the same
+  repository, written in Go (https://go.dev), standard library only (BSD licence).
+  Source: @REPO_URL@
+  (folders build/ and patch/). Licence: MIT, the LICENSE file there (and LICENSE.txt on this card).
+
+PARTS BUILT FOR THIS FIRMWARE (versions as on the card)
+  RetroArch 1.22.2              GPL-3.0     https://github.com/libretro/RetroArch (tag v1.22.2)
+                                            our build changes: build/makefile-g36.patch, build/src/oga_gfx-g36.patch
+                                            and build/oga_gfx-osd.patch in the repository
+  FFmpeg 4.4.4                  LGPL-2.1+   https://ffmpeg.org/releases/ffmpeg-4.4.4.tar.xz
+                                            built as a shared library without any GPL or non-free parts
+                                            (no x264, x265 or OpenSSL); the exact configure line is in
+                                            build/ffmpeg-lgpl/BUILD.txt in the repository
+  uMTP-Responder 1.8.1          GPL-3.0+    https://github.com/viveris/uMTP-Responder
+                                            our change: build/g36/umtprd-g36.patch in the repository
+  exfatprogs 1.4.3              GPL-2.0     https://github.com/exfatprogs/exfatprogs
+  alsa-lib 1.2.11               LGPL-2.1+   https://www.alsa-project.org
+  FreeType 2.13.2               FTL / GPL-2 https://freetype.org
+  libdrm 2.4.120                MIT         https://gitlab.freedesktop.org/mesa/drm
+  librga 1.10.0 (Rockchip)      Apache-2.0  https://github.com/airockchip/librga
+  llama.cpp b11177 and ggml     MIT         https://github.com/ggml-org/llama.cpp
+  stb_image                     public domain / MIT   https://github.com/nothings/stb
+
+EMULATORS (the G36-EMU drive, cores/)
+  The libretro cores listed in CREDITS.txt, each under its own licence and with its source in
+  its libretro repository: https://github.com/libretro/<core name>. Several are GPL; some,
+  including Snes9x, Genesis Plus GX, FinalBurn Neo, FB Alpha and the MAME cores, allow
+  non-commercial use only.
+
+THE BASE SYSTEM
+  The rest of the system is the handheld's own Rockchip RK3506 firmware (Buildroot 2024.02,
+  Linux 6.1.84 from Rockchip's SDK), left as it came apart from what's listed above and the
+  start-up scripts we changed (/oem/release/config/usrrun.sh and /etc/init.d/S50usbdevice.sh: the
+  vendor's, with our changes for the USB settings, volume, power-off and crash guard; plain text on
+  the handheld, so they're not in the repository). The free
+  software in it includes: the Linux kernel (GPL-2.0), BusyBox 1.36.1, bash 5.2, util-linux 2.39.3,
+  e2fsprogs 1.47.0, alsa-utils 1.2.12, BlueZ 5.77, D-Bus 1.14.10, dhcpcd 10.0.8, irqbalance 1.9.0,
+  iperf 2.1.9, SDL2 2.28.5, Mesa (OSMesa) with LLVM 15, OpenSSL 3, and the Android Debug Bridge
+  daemon 1.0.39 (Apache-2.0). Each is under its own licence; the source of each version is at its
+  project's website (and Rockchip's SDK has the kernel and the system's build files).
+
+GETTING THE SOURCE
+  Everything above that is GPL or LGPL: its complete source (the upstream releases at the versions
+  shown, plus the changes in the repository) is in the source archive attached to the same
+  release as this firmware image:
+  @REPO_URL@/releases
+  If you can't get it there, ask in the repository's issues and it will be sent to you.

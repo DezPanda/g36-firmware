@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT -- Copyright (c) 2026 DezPanda
+# g36-sleep: put the handheld to sleep.
+#
+# The menu runs this (Power prompt, Settings), and so does g36d (tapping Power twice in a
+# game). With a game running, the sleep is not a plain suspend: sound streams that are
+# open across a suspend come back silent on this hardware. So the game is closed with
+# Select + B (RetroArch writes its auto state and the game's own save), the
+# handheld sleeps with just the menu running, and on waking the same game is started
+# again with that state loaded. (The in-game Power double-tap in g36d starts this too.)
+#
+# Before suspending, everything is flushed to the card and the card is made read-only; it
+# is made writable again on waking. If the handheld ever failed to wake, nothing was being
+# written, so holding Power to force a restart cannot corrupt the card.
+
+LOG=/tmp/g36-sleep.log
+SLEEPING=/tmp/sleeping          # the menu starts with its screen off while this exists
+WAKE=/tmp/sleep-wake            # retroarch_r starts the next game with its state loaded
+SAVES=/mnt/sdcard/saves
+MARKER=/mnt/sdcard/g36/sleep-state.cfg   # what the menu offers to load if the wake-up start goes wrong
+exec >> $LOG 2>&1
+
+[ -f $SLEEPING ] && exit 0
+touch $SLEEPING
+echo "== sleep $(date)"
+
+core=; rom=
+ra=$(pidof retroarch-1.22)
+if [ -n "$ra" ]; then
+	# what is running: "-L core rom" at the end of its command line
+	args=$(tr '\0' '\n' < /proc/$ra/cmdline)
+	core=$(echo "$args" | sed -n '/^-L$/{n;p;}')
+	rom=$(echo "$args" | tail -n 1)
+	echo "game: core=$core rom=$rom"
+	system=$(echo "$rom" | sed -n 's|^/mnt/sdcard/roms/\([^/]*\)/.*|\1|p')
+	dir="$SAVES/$system"
+	if [ -z "$core" ] || [ -z "$system" ]; then
+		echo "can't tell what is running"
+		rm -f $SLEEPING
+		exit 1
+	fi
+	printf 'core_path = "%s"\nrom_path = "%s"\n' "$core" "$rom" > /tmp/sleep-game
+	touch /tmp/sleep-mark   # (a state file newer than this was written by this close)
+	sleep 1
+
+	# close the game the way Select + B does: RetroArch writes its auto state ("<game>.state.auto")
+	# and the game's own save; the startup loop then starts the menu
+	/usr/bin/g36-key select+b
+	i=0
+	while [ $i -lt 60 ] && pidof retroarch-1.22 >/dev/null; do sleep 0.5; i=$((i+1)); done
+	pidof retroarch-1.22 >/dev/null && { echo "RetroArch didn't close: killing it"; killall retroarch-1.22; sleep 2; }
+	after=$(find "$dir" -name '*.state.auto' -newer /tmp/sleep-mark 2>/dev/null | head -n 1)
+	if [ -z "$after" ]; then
+		# this game's emulator can't make a state: the game is closed and saved normally,
+		# but there's nothing to come back to, so no sleep
+		echo "no state was written: not sleeping"
+		rm -f /tmp/sleep-game
+		touch /tmp/sleep-failed
+		rm -f $SLEEPING
+		exit 1
+	fi
+	echo "state: $(ls -l "$after")"
+	# the menu comes up (screen off, because of $SLEEPING)
+	i=0
+	while [ $i -lt 40 ] && ! pidof g36menu >/dev/null; do sleep 0.5; i=$((i+1)); done
+	sleep 1
+fi
+
+# Remember which game and state this sleep belongs to, on the card (a crash or a failed wake can lose /tmp).
+# g36-logs removes it when the game started from it ends cleanly; the menu offers it if it is still there.
+if [ -n "$core" ] && [ -n "$after" ]; then
+	printf 'rom_path = "%s"\ncore_path = "%s"\nstate_path = "%s"\nstatus = sleeping\n' "$rom" "$core" "$after" > $MARKER.new \
+		&& mv -f $MARKER.new $MARKER
+fi
+sync
+mount -o remount,ro / ; mount -o remount,ro /mnt/sdcard
+echo "going to sleep $(date)"
+echo mem > /sys/power/state
+echo "woke $(date)"
+mount -o remount,rw / ; mount -o remount,rw /mnt/sdcard
+# the USB controller comes back from sleep unable to enumerate a cable plugged in afterwards (the host
+# sees it reset over and over): set USB up again, which unbinds and rebinds it and restarts adbd / umtprd
+/usr/sbin/g36-filetransfer refresh >/dev/null 2>&1
+
+if [ -f /tmp/sleep-game ]; then
+	# back into the game: the menu closes and the startup loop starts it, state loaded
+	sed -i 's/^status = .*/status = resumed/' $MARKER 2>/dev/null
+	cp /tmp/sleep-game /tmp/game.cfg
+	rm -f /tmp/sleep-game
+	touch $WAKE
+	start-stop-daemon -K -q -p /var/run/gamebox.pid
+fi
+sleep 3
+rm -f $SLEEPING
+echo "awake $(date)"
