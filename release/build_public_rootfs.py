@@ -64,6 +64,10 @@ GAMEBOX_JSON = "oem/release/config/gamebox.json"
 STORAGE = "etc/init.d/S05g36storage"
 STORAGE_SRC = os.path.join(HERE, "..", "patch", "S05g36storage")
 
+# the menu is the public build (compiled with -DG36_PUBLIC), made by build/g36/menu/build.sh and copied here
+MENU = "usr/bin/g36menu"
+MENU_SRC = os.path.join(HERE, "g36menu-public")
+
 
 REPO_URL = ""
 
@@ -110,6 +114,10 @@ def main():
             new = re.sub(r'("back_light" *: *)\d+', r'\g<1>50', new)
             repl(n, new.encode(), m.mode & 0o7777)
             lines.append("CHANGED   %-60s %9d  volume and brightness back to 50" % (n, len(new)))
+        elif n == MENU:
+            new = open(MENU_SRC, "rb").read()
+            repl(n, new, m.mode & 0o7777)
+            lines.append("REPLACED  %-60s %9d  the public build of the menu" % (n, len(new)))
         elif n == STORAGE:
             new = open(STORAGE_SRC, "rb").read()
             assert b".starter-copied" in new and b"blank()" in new, "patch/S05g36storage is the old one"

@@ -25,6 +25,112 @@ if [ -n "$system" ]; then
 	mkdir -p "$SAVES/$system"
 	printf 'savefile_directory = "%s"\nsavestate_directory = "%s"\n' "$SAVES/$system" "$SAVES/$system" > $OVERRIDE
 fi
+# Picture shape: the emulator reports its console's own aspect ratio (GBA 3:2, Game Boy 10:9,
+# arcade 4:3 or 3:4 for vertical games ...), so use that ("core provided", index 22). The
+# Master System / SG-1000 and PC Engine cores report shapes the TVs never showed, so those get 4:3.
+case "$system" in
+	mastersystem|sg-1000|pcengine|tg16|pcenginecd) aspect=0 ;;
+	*) aspect=22 ;;
+esac
+printf 'aspect_ratio_index = "%s"\n' $aspect >> $OVERRIDE
+# Button remapping (Controls on the home screen): g36/remap.cfg has a line per console, "<console> pad=a,b,x,y,l,r,select,start,menu
+# hot=select,b,r,l,x,a,left,right" ("*" for every console without its own): pad names the button that acts as the game's A, B,
+# X, Y, L, R, Select and Start, and last the one that opens RetroArch's menu (an older line with eight is the same with the menu
+# on Menu); hot the button held for the shortcuts, then the buttons for quit, save state, load state,
+# fast-forward, pause, save slot down and up. RetroArch reads which button is which from the controller's autoconfig file, so a
+# changed copy of that is made in RAM and RetroArch is pointed at it for this game; the shortcuts are plain settings.
+REMAP=/mnt/sdcard/g36/remap.cfg
+AUTOCFG=/oem/retroarch/autoconfig
+# RetroArch's numbers for the keypad's buttons: the four arrows first (up 0, left 1, right 2, down 3), then A B X Y L R Select
+# Start. (The factory files used 17 to 20 for the arrows, which are not buttons this keypad has.)
+ra_num() {
+	case "$1" in
+		a) echo 4 ;; b) echo 5 ;; x) echo 6 ;; y) echo 7 ;; l) echo 8 ;; r) echo 9 ;; select) echo 10 ;; start) echo 11 ;;
+		up) echo 0 ;; left) echo 1 ;; right) echo 2 ;; down) echo 3 ;;
+		menu) echo menu ;;
+	esac
+}
+pad=; hot=; dev=
+if [ -n "$system" ] && [ -f $REMAP ]; then
+	line=; star=
+	while read -r name rest; do
+		case "$name" in
+			"$system") line=$rest ;;
+			'*') star=$rest ;;
+		esac
+	done < $REMAP
+	[ -z "$line" ] && line=$star
+	for tok in $line; do
+		case "$tok" in
+			pad=*) pad=${tok#pad=} ;;
+			hot=*) hot=${tok#hot=} ;;
+			dev=*) dev=${tok#dev=} ;;
+		esac
+	done
+fi
+oldifs=$IFS
+[ -z "$pad" ] && pad=a,b,x,y,l,r,select,start,menu
+case "$pad" in *,*,*,*,*,*,*,*,*) ;; *) pad=$pad,menu ;; esac   # (an older line has no word for the menu button)
+[ -z "$hot" ] && hot=select,b,r,l,x,a,left,right
+# the controller's own settings file is only copied when something in it changes: other buttons for the game's, or (a
+# DualShock) the left stick, which is the arrow keys, on the pad's left analog stick and off the d-pad
+if [ "$pad" != "a,b,x,y,l,r,select,start,menu" ] || [ "$dev" = 517 ]; then
+	rm -rf /tmp/g36-autoconfig
+	mkdir -p /tmp/g36-autoconfig
+	cp $AUTOCFG/*.cfg /tmp/g36-autoconfig/
+	IFS=,; set -- $pad; IFS=$oldifs
+	sedscript=
+	for fn in a b x y l r select start; do
+		n=$(ra_num "$1")
+		if [ "$n" = menu ]; then
+			# the Menu button is a key, not one of the keypad's numbered buttons: it is bound as a keyboard key
+			sedscript="$sedscript;s/^input_${fn}_btn = .*/input_${fn}_btn = \"nul\"/"
+			printf 'input_player1_%s = "menu"\n' $fn >> $OVERRIDE
+		elif [ -n "$n" ]; then
+			sedscript="$sedscript;s/^input_${fn}_btn = .*/input_${fn}_btn = \"$n\"/"
+		fi
+		shift
+	done
+	# whoever has the menu's job (Menu itself unless it was moved): if it isn't the Menu key, that key no longer opens it
+	n=$(ra_num "$1")
+	if [ -n "$n" ] && [ "$n" != menu ]; then
+		printf 'input_menu_toggle = "nul"\ninput_menu_toggle_btn = "%s"\n' "$n" >> $OVERRIDE
+	fi
+	if [ "$dev" = 517 ]; then
+		sedscript="$sedscript;s/^input_l_x_minus_btn = .*/input_l_x_minus_btn = \"1\"/;s/^input_l_x_plus_btn = .*/input_l_x_plus_btn = \"2\"/"
+		sedscript="$sedscript;s/^input_l_y_minus_btn = .*/input_l_y_minus_btn = \"0\"/;s/^input_l_y_plus_btn = .*/input_l_y_plus_btn = \"3\"/"
+		# the arrows must not also press the d-pad (the game would turn the camera with it)
+		printf 'input_player1_up = "nul"\ninput_player1_down = "nul"\ninput_player1_left = "nul"\ninput_player1_right = "nul"\n' >> $OVERRIDE
+	fi
+	sed -i "${sedscript#;}" /tmp/g36-autoconfig/Chbp.cfg
+	printf 'joypad_autoconfig_dir = "/tmp/g36-autoconfig"\n' >> $OVERRIDE
+fi
+# the kind of controller the emulator is told is plugged in (PlayStation: 1 standard, 517 DualShock). RetroArch only takes
+# that from a core's remap file, so one is made in RAM and RetroArch is pointed at it (only for games with a controller type
+# set; the PlayStation core is the one that has a use for it)
+if [ -n "$dev" ]; then
+	case "$core" in
+		*pcsx_rearmed*) coreName="PCSX-ReARMed" ;;
+		*) coreName= ;;
+	esac
+	if [ -n "$coreName" ]; then
+		rm -rf /tmp/g36-remap
+		mkdir -p "/tmp/g36-remap/$coreName"
+		printf 'input_libretro_device_p1 = "%s"\n' "$dev" > "/tmp/g36-remap/$coreName/$coreName.rmp"
+		printf 'input_remapping_directory = "/tmp/g36-remap"\n' >> $OVERRIDE
+	fi
+fi
+# the FPS counter over the game: on unless Settings (g36/settings.cfg, fps_show = 0) turned it off
+if [ -f /mnt/sdcard/g36/settings.cfg ] && grep -q '^fps_show *= *0' /mnt/sdcard/g36/settings.cfg; then
+	printf 'fps_show = "false"\n' >> $OVERRIDE
+fi
+# the shortcuts: always written, so the numbers are right even when nothing was changed
+IFS=,; set -- $hot; IFS=$oldifs
+for key in enable_hotkey exit_emulator save_state load_state toggle_fast_forward pause_toggle state_slot_decrease state_slot_increase; do
+	n=$(ra_num "$1")
+	[ -n "$n" ] && printf 'input_%s_btn = "%s"\n' $key "$n" >> $OVERRIDE
+	shift
+done
 # Closing a game writes a state beside its other saves ("<game>.state.auto", apart from the
 # manual save states). Only a start right after a sleep loads it: g36-sleep closes the game
 # with that, and the wake starts it again at the same moment.

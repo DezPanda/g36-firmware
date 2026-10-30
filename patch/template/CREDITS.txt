@@ -106,6 +106,13 @@ The menu, chatbot and image generator draw their text in Open Sans Semibold
 (Steve Matteson; Apache 2.0), the font the handheld's own firmware came with.
 
 
+THE LITTLE CARTRIDGE PICTURE
+----------------------------
+A game with no thumbnail shows a small cartridge (or a disc, for disc-based
+consoles). The cartridge is a lightened copy of the Famicom/NES cartridge
+drawing on Wikimedia Commons, released into the public domain under CC0.
+
+
 THE HANDHELD ITSELF
 -------------------
 The handheld (sold as the "G36", built on a Rockchip RK3506B) runs Rockchip's

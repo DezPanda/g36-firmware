@@ -34,11 +34,13 @@
 #include "player.h"
 
 #include "../board.h"
+#include "cartridge_icon.h"
 #define SDCARD     BOARD_GAMES_MOUNT
 #define ROMS       SDCARD "/roms"
 #define SYSCFG     SDCARD "/g36/systems.cfg"
 #define GAMECORES  SDCARD "/g36/game-cores.cfg"
 #define STATEFILE  SDCARD "/g36/menu-state"
+#define BOOT_SEEN  "/tmp/g36menu-started"   /* made by the first menu start after the handheld was switched on */
 #define CORE_DIR   BOARD_EMU_MOUNT "/cores"
 #define LIBCACHE   SDCARD "/g36/library.cache"
 #define MAX_DEPTH  4                           /* subfolder levels scanned inside a console */
@@ -74,6 +76,7 @@ enum {
    TH_LET1, TH_LET2, TH_LET3, TH_LET4, TH_LET5, TH_LET_EDGE,
    TH_ACCENT, TH_TEXT, TH_DIM, TH_FAINT, TH_SEL, TH_PANEL, TH_PICBOX, TH_DOTS,
    TH_BAR, TH_BAR_BOX, TH_BAR_LINE, TH_KEY, TH_KEY_LINE, TH_SUGGEST,
+   TH_CARDL_TOP, TH_CARDL_BOT,   /* the light cards' colours: shown with the CARDS rows, worked out from them in a preset */
    TH_COUNT
 };
 typedef struct { const char *key, *label, *group; uint32_t def, v; } themecol_t;
@@ -81,8 +84,8 @@ static themecol_t th[TH_COUNT] = {
    { "background_top",    "Top",             "BACKGROUND",          0xff24152b, 0xff24152b },
    { "background_bottom", "Bottom",          NULL,                  0xff130b17, 0xff130b17 },
    { "background_light",  "Light",           NULL,                  0xff562876, 0xff562876 },
-   { "card_top",          "Top",             "CARDS",               0xff3f264b, 0xff3f264b },
-   { "card_bottom",       "Bottom",          NULL,                  0xff22132a, 0xff22132a },
+   { "card_top",          "Dark top",        "CARDS",               0xff3f264b, 0xff3f264b },
+   { "card_bottom",       "Dark bottom",     NULL,                  0xff22132a, 0xff22132a },
    { "card_outline",      "Outline",         NULL,                  0xff4f3360, 0xff4f3360 },
    { "lettering_1",       "Top",             "LETTERING",           0xffc07dff, 0xffc07dff },
    { "lettering_2",       "Upper middle",    NULL,                  0xffff7fe6, 0xffff7fe6 },
@@ -104,6 +107,8 @@ static themecol_t th[TH_COUNT] = {
    { "key",               "Keys",            NULL,                  0xff4a2f58, 0xff4a2f58 },
    { "key_outline",       "Key outline",     NULL,                  0xff7a5a8c, 0xff7a5a8c },
    { "suggestion",        "Suggestions",     NULL,                  0xff5a3a6c, 0xff5a3a6c },
+   { "card_light_top",    "Light top",       "CARDS",               0xff8a6a98, 0xff8a6a98 },   /* (worked out at start from the card colour and accent) */
+   { "card_light_bottom", "Light bottom",    NULL,                  0xff6a4a78, 0xff6a4a78 },
 };
 #define TH(i) (th[i].v)
 #define C_PANEL     TH(TH_PANEL)
@@ -185,6 +190,8 @@ typedef struct
    char *rel;
    int n;
    unsigned long long hash;
+   long long mtime;   /* the folder's modification time (ns) when it was last looked at in full; 0 = not known */
+   time_t full;       /* and when */
 } dirsig_t;
 
 typedef struct
@@ -333,6 +340,7 @@ static int visible[MAX_SYSTEMS], nvisible;
 static int refresh_counts(void);
 static void thumbs_clear(void);
 static void large_clear(void);
+static void gcard_clear(void);
 
 /* ------------------------------------------------------------- game list */
 
@@ -559,6 +567,15 @@ static void dir_sig(const char *dir, int *n, unsigned long long *hash)
    closedir(d);
 }
 
+/* a folder's modification time in nanoseconds (0 if it can't be read); it changes when a name is added, removed or renamed in it */
+static long long dir_mtime(const char *dir)
+{
+   struct stat st;
+   if (stat(dir, &st) != 0)
+      return 0;
+   return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+}
+
 static void sys_dir(const system_t *s, const char *rel, char *out, size_t sz)
 {
    snprintf(out, sz, "%s/%s%s%s", ROMS, s->id, rel[0] ? "/" : "", rel);
@@ -581,7 +598,7 @@ static void lib_clear(system_t *s)
    s->ngames = s->gcap = s->ndirs = s->dcap = 0;
 }
 
-static void lib_add_dir(system_t *s, const char *rel, int n, unsigned long long hash)
+static void lib_add_dir(system_t *s, const char *rel, int n, unsigned long long hash, long long mtime)
 {
    if (s->ndirs == s->dcap)
    {
@@ -591,6 +608,8 @@ static void lib_add_dir(system_t *s, const char *rel, int n, unsigned long long 
    s->dirs[s->ndirs].rel = strdup(rel);
    s->dirs[s->ndirs].n = n;
    s->dirs[s->ndirs].hash = hash;
+   s->dirs[s->ndirs].mtime = mtime;
+   s->dirs[s->ndirs].full = time(NULL);
    s->ndirs++;
 }
 
@@ -615,10 +634,12 @@ static void scan_dir(system_t *s, const char *rel, int depth)
    struct dirent *e;
    DIR *d;
    int n;
+   long long mt;
 
    sys_dir(s, rel, dir, sizeof(dir));
+   mt = dir_mtime(dir);   /* (before the folder is read, so a change in between shows up next time) */
    dir_sig(dir, &n, &hash);
-   lib_add_dir(s, rel, n, hash);
+   lib_add_dir(s, rel, n, hash, mt);
    if (n <= 0 || !(d = opendir(dir)))
       return;
    m3u_discs(dir, &discs);
@@ -666,9 +687,13 @@ static void lib_scan(system_t *s)
    pthread_mutex_unlock(&lib_m);
 }
 
-static int lib_changed(const system_t *s)
+/* Has anything changed in a console's folders? A folder whose modification time hasn't moved is not read again (reading every
+ * folder every couple of seconds was a few percent of a core on a still menu); every 30 seconds each is read in full anyway,
+ * which also catches a playlist's contents changing under the same name. */
+static int lib_changed(system_t *s)
 {
    int i;
+   time_t now = time(NULL);
    if (!s->known)
       return 1;
    for (i = 0; i < s->ndirs; i++)
@@ -676,10 +701,16 @@ static int lib_changed(const system_t *s)
       char dir[1024];
       unsigned long long hash;
       int n;
+      long long mt;
       sys_dir(s, s->dirs[i].rel, dir, sizeof(dir));
+      mt = dir_mtime(dir);
+      if (mt && mt == s->dirs[i].mtime && now - s->dirs[i].full < 30)
+         continue;
       dir_sig(dir, &n, &hash);
       if (n != s->dirs[i].n || hash != s->dirs[i].hash)
          return 1;
+      s->dirs[i].mtime = mt;
+      s->dirs[i].full = now;
    }
    return 0;
 }
@@ -773,7 +804,7 @@ static void lib_load(void)
          int n, off = 0;
          unsigned long long hash;
          if (sscanf(line + 2, "%d %llu %n", &n, &hash, &off) >= 2 && off)
-            lib_add_dir(s, line + 2 + off, n, hash);
+            lib_add_dir(s, line + 2 + off, n, hash, 0);
       }
       else if (s && !strncmp(line, "G ", 2))
       {
@@ -1322,6 +1353,21 @@ static void add_recent(const char *key)
    free_keys(keys, n);
 }
 
+/* take a game out of Recently Played (it is only the list that changes; the game stays on the card) */
+static void remove_recent(const char *key)
+{
+   char **keys;
+   int n = read_keys(RECENT_FILE, &keys), i, j = 0;
+   for (i = 0; i < n; i++)
+      if (strcmp(keys[i], key))
+         keys[j++] = keys[i];
+      else
+         free(keys[i]);
+   if (j != n)
+      write_keys(RECENT_FILE, keys, j);
+   free_keys(keys, j);
+}
+
 static void display_name(const entry_t *e, char *out, size_t sz)
 {
    snprintf(out, sz, "%s", e->label);
@@ -1455,6 +1501,153 @@ static void current_dir(char *out, size_t sz)
       snprintf(out, sz, "%s/%s", ROMS, s->id);
 }
 
+/* ---- the games carousel (Theme card: Games Carousel). A game list drawn like the home screen: each folder is a row (the
+ * console's loose games are the first), each game a square card with its title under the chosen one. The list in ui.list then
+ * holds every game of the console, folder after folder, with the folder in the name ("Ape Escape/Ape Escape.cue"); a row is one
+ * run of it. */
+static int theme_games_carousel = 1;   /* on unless theme.cfg says "games_carousel = off" */
+
+typedef struct
+{
+   char title[160];
+   int first, n;
+} grow_t;
+
+static struct
+{
+   int on;                 /* the open list is drawn as a carousel */
+   grow_t *row;
+   int nrow, cap;
+   int *pos;               /* per row: the chosen card, unbounded (a row loops) */
+   double *anim;           /* per row: the same, as it slides */
+   int row_pos;            /* the focused row, unbounded (the rows loop too) */
+   double row_anim;
+   int glint_sel;          /* the card the glint went to last, and when it began and ends */
+   double glint_t0, glint_until;
+} gc;
+static int gc_moving;       /* a row or card is still sliding: the main loop draws every refresh */
+
+/* a folder's games after the loose ones; each in name order */
+static int entry_cmp_flat(const void *a, const void *b)
+{
+   const entry_t *x = a, *y = b;
+   const char *sx = strrchr(x->name, '/'), *sy = strrchr(y->name, '/');
+   int c;
+   if (!sx != !sy)
+      return sx ? 1 : -1;
+   if (sx)
+   {
+      char dx[512], dy[512];
+      snprintf(dx, sizeof(dx), "%.*s", (int)(sx - x->name), x->name);
+      snprintf(dy, sizeof(dy), "%.*s", (int)(sy - y->name), y->name);
+      c = natcmp(dx, dy);
+      if (c)
+         return c;
+   }
+   c = natcmp(x->label, y->label);
+   return c ? c : natcmp(x->name, y->name);
+}
+
+/* every game of a console, folders and all, in the carousel's order (names are paths inside roms/<console>/) */
+static void list_flat_library(list_t *l, const system_t *s)
+{
+   int i;
+   list_free(l);
+   if (!s)
+      return;
+   for (i = 0; i < s->ngames; i++)
+      list_add(l, s->games[i].path, s->games[i].label, 0, (int)(s - systems));
+   list_finish(l);   /* (clean names that collide keep their tags) */
+   qsort(l->e, l->n, sizeof(entry_t), entry_cmp_flat);
+}
+
+/* the rows, from ui.list: a console's list splits at the folders; a collection is one row */
+static void gc_build(void)
+{
+   int i, r = -1, n = ui.list.n;
+   char prev[512] = "";
+
+   free(gc.row);
+   free(gc.pos);
+   free(gc.anim);
+   gc.row = NULL;
+   gc.pos = NULL;
+   gc.anim = NULL;
+   gc.nrow = gc.cap = 0;
+   gc.on = theme_games_carousel && n > 0;
+   if (!gc.on)
+      return;
+   for (i = 0; i < n; i++)
+   {
+      const char *name = ui.list.e[i].name, *sl = strrchr(name, '/');
+      char dir[512];
+      snprintf(dir, sizeof(dir), "%.*s", !ui.list_all && sl ? (int)(sl - name) : 0, name);
+      if (r < 0 || strcmp(dir, prev))
+      {
+         grow_t *g;
+         if (gc.nrow == gc.cap)
+         {
+            gc.cap = gc.cap ? gc.cap * 2 : 16;
+            gc.row = realloc(gc.row, gc.cap * sizeof(grow_t));
+            if (!gc.row)
+            {
+               gc.on = 0;
+               gc.nrow = gc.cap = 0;
+               return;
+            }
+         }
+         r = gc.nrow++;
+         g = &gc.row[r];
+         g->first = i;
+         g->n = 0;
+         if (ui.list_all)
+            snprintf(g->title, sizeof(g->title), ui.coll == COLL_SEARCH ? "Search: %s" : "%s",
+                  ui.coll == COLL_SEARCH ? search_q : colls[ui.coll < ncolls ? ui.coll : 0].name);
+         else if (!dir[0])
+            snprintf(g->title, sizeof(g->title), "%s", cur_system() ? cur_system()->name : "");
+         else
+         {
+            char *o = g->title;
+            const char *q;
+            for (q = dir; *q && o < g->title + sizeof(g->title) - 4; q++)
+               if (*q == '/')
+               {
+                  *o++ = ' ';
+                  *o++ = '/';
+                  *o++ = ' ';
+               }
+               else
+                  *o++ = *q;
+            *o = 0;
+         }
+         snprintf(prev, sizeof(prev), "%s", dir);
+      }
+      gc.row[r].n++;
+   }
+   gc.pos = calloc(gc.nrow, sizeof(int));
+   gc.anim = calloc(gc.nrow, sizeof(double));
+   if (!gc.pos || !gc.anim)
+      gc.on = 0;
+   gc.glint_sel = -1;
+}
+
+/* the focused row and card follow ui.sel (no slide) */
+static void gc_focus(void)
+{
+   int r;
+   if (!gc.on)
+      return;
+   for (r = 0; r < gc.nrow; r++)
+      if (ui.sel >= gc.row[r].first && ui.sel < gc.row[r].first + gc.row[r].n)
+         break;
+   if (r >= gc.nrow)
+      r = 0;
+   gc.row_pos = r;
+   gc.row_anim = r;
+   gc.pos[r] = ui.sel - gc.row[r].first;
+   gc.anim[r] = gc.pos[r];
+}
+
 static void reload_list(void)
 {
    char keep[256] = "";
@@ -1468,14 +1661,29 @@ static void reload_list(void)
       snprintf(keep, sizeof(keep), "%s", ui.list.e[ui.sel].name);
    ui.want_entry[0] = 0;
 
+   if (theme_games_carousel && !ui.list_all && ui.folder[0])
+   {
+      /* a folder's list from before: the carousel has them all, with the folder in each name */
+      if (keep[0])
+      {
+         char full[512];
+         snprintf(full, sizeof(full), "%s/%s", ui.folder, keep);
+         snprintf(keep, sizeof(keep), "%.255s", full);
+      }
+      ui.folder[0] = 0;
+   }
    if (ui.list_all)
       list_collection(&ui.list, ui.coll < ncolls ? ui.coll : COLL_ALL);
+   else if (theme_games_carousel)
+      list_flat_library(&ui.list, cur_system());
    else
       list_from_library(&ui.list, cur_system(), ui.folder);
    ui.sel = 0;
    for (i = 0; keep[0] && i < ui.list.n; i++)
       if (!strcmp(ui.list.e[i].name, keep))
          ui.sel = i;
+   gc_build();
+   gc_focus();
 }
 
 static const char *coll_empty_msg(int ci)
@@ -1583,6 +1791,90 @@ static void letter_jump(int dir, double now)
    toast(msg, now);
 }
 
+/* the carousel's L / R: to the first game of the next (or previous) letter along the row, wrapping */
+static void gc_letter(int dir, double now)
+{
+   grow_t *rw = &gc.row[wrap(gc.row_pos, gc.nrow)];
+   int n = rw->n, lo = rw->first, start = ui.sel - lo, i = start;
+   char cur, msg[4];
+   if (n < 2)
+      return;
+   cur = entry_letter(&ui.list.e[lo + i]);
+   if (dir > 0)
+   {
+      do
+         i = (i + 1) % n;
+      while (i != start && entry_letter(&ui.list.e[lo + i]) == cur);
+   }
+   else
+   {
+      char prev;
+      while (i > 0 && entry_letter(&ui.list.e[lo + i - 1]) == cur)
+         i--;
+      i = (i + n - 1) % n;
+      prev = entry_letter(&ui.list.e[lo + i]);
+      while (i > 0 && entry_letter(&ui.list.e[lo + i - 1]) == prev)
+         i--;
+   }
+   gc.pos[wrap(gc.row_pos, gc.nrow)] = i;   /* (a long way: no slide) */
+   gc.anim[wrap(gc.row_pos, gc.nrow)] = i;
+   ui.sel = lo + i;
+   snprintf(msg, sizeof(msg), "%c", entry_letter(&ui.list.e[ui.sel]));
+   toast(msg, now);
+}
+
+/* the carousel's buttons: the d-pad along the row and between the rows, L / R by letter; 1 = it was one of those */
+static int gc_nav(int code, double now)
+{
+   int r, d;
+   if (!gc.on || !gc.nrow)
+      return 0;
+   r = wrap(gc.row_pos, gc.nrow);
+   if (code == KEY_LEFT || code == KEY_RIGHT)
+   {
+      d = code == KEY_LEFT ? -1 : 1;
+      gc.pos[r] += d;
+      ui.sel = gc.row[r].first + wrap(gc.pos[r], gc.row[r].n);
+   }
+   else if (code == KEY_UP || code == KEY_DOWN)
+   {
+      if (gc.nrow > 1)
+      {
+         gc.row_pos += code == KEY_UP ? -1 : 1;
+         r = wrap(gc.row_pos, gc.nrow);
+         ui.sel = gc.row[r].first + wrap(gc.pos[r], gc.row[r].n);
+      }
+   }
+   else if (code == BTN_TL || code == BTN_TR)
+      gc_letter(code == BTN_TL ? -1 : 1, now);
+   else
+      return 0;
+   return 1;
+}
+
+/* every frame: the rows and cards ease towards where they should be (like the home screen's); 1 while any is still moving */
+static int gc_ease(void)
+{
+   int r, moving = 0;
+   if (!gc.on)
+      return 0;
+   gc.row_anim += (gc.row_pos - gc.row_anim) * 0.3;
+   if (fabs(gc.row_pos - gc.row_anim) < 0.01)
+      gc.row_anim = gc.row_pos;
+   else
+      moving = 1;
+   for (r = 0; r < gc.nrow; r++)
+      if (gc.anim[r] != gc.pos[r])
+      {
+         gc.anim[r] += (gc.pos[r] - gc.anim[r]) * 0.3;
+         if (fabs(gc.pos[r] - gc.anim[r]) < 0.01)
+            gc.anim[r] = gc.pos[r];
+         else
+            moving = 1;
+      }
+   return moving;
+}
+
 static void save_state(void)
 {
    FILE *f = fopen(STATEFILE, "w");
@@ -1678,6 +1970,7 @@ static void pick_core(const system_t *s, const char *rom, char *out, size_t sz)
 }
 
 static int launch_core(const system_t *s, const char *rom, const char *core);
+static void bezel_write_rom(const char *rom);
 static int game_find(const char *key, int *sys, int *gi);
 static char err_title[160], err_line1[160], err_line2[160];
 static int core_installed(const char *core);
@@ -1699,7 +1992,9 @@ static struct
    int sys;
    char rom[1300], core[64];
    int sleep;   /* it is waiting on "load the sleep state, or start normally", not on "Play anyway" */
+   int psx;     /* it is the PlayStation sticks note: "Play" or "Play, don't show this again" */
 } pending;   /* the launch waiting on "Play anyway" */
+static int prompt_toggle;   /* the switch on a prompt that has one ("Don't show again") is on */
 
 /* ---- the sleep marker: g36-sleep writes it (on the card) when it puts a game to sleep, and g36-logs removes
  * it once the game that was started from it has ended cleanly. Still there when that game is launched from
@@ -1745,7 +2040,9 @@ static int sleep_marker_for(const char *rom, sleepmark_t *m)
 /* start the game with its sleep state loaded, the way g36-sleep does on waking; 0 = launching */
 static int sleep_load(const sleepmark_t *m)
 {
-   FILE *f = fopen(GAMECFG, "w");
+   FILE *f;
+   bezel_write_rom(m->rom);
+   f = fopen(GAMECFG, "w");
    if (!f)
       return -1;
    fprintf(f, "core_path = \"%s\"\nrom_path = \"%s\"\ng36_menu = \"1\"\n", m->core, m->rom);
@@ -1919,6 +2216,7 @@ static int zip_fits(const system_t *s, const char *rom)
 
 /* returns 0 = launching, -2 = can't (err_* says why), -3 = a warning (ask first) */
 static int launch_core_checked(const system_t *s, const char *rom, const char *core, int force);
+static int setting_int(const char *key, int def);
 
 static int launch_core(const system_t *s, const char *rom, const char *core)
 {
@@ -1949,6 +2247,7 @@ static int launch_core_checked(const system_t *s, const char *rom, const char *c
          snprintf(pending.rom, sizeof(pending.rom), "%s", rom);
          snprintf(pending.core, sizeof(pending.core), "%s", core);
          pending.sleep = 1;
+         pending.psx = 0;
          snprintf(err_title, sizeof(err_title), "Load the sleep save state?");
          snprintf(err_line1, sizeof(err_line1), "This game's last sleep didn't finish: it may have crashed.");
          snprintf(err_line2, sizeof(err_line2), "Load the state saved when you slept, or start normally?");
@@ -1959,15 +2258,32 @@ static int launch_core_checked(const system_t *s, const char *rom, const char *c
    if (!force && (!bios_check(s) || !zip_fits(s, rom)))
    {
       pending.sleep = 0;
+      pending.psx = 0;
       pending.sys = (int)(s - systems);
       snprintf(pending.rom, sizeof(pending.rom), "%s", rom);
       snprintf(pending.core, sizeof(pending.core), "%s", core);
       mlog("launch warning for %s: %s %s", rom, err_title, err_line1);
       return -3;
    }
+   if (!force && !strcmp(s->id, "psx") && !setting_int("psx_sticks_warned", 0))
+   {
+      /* the sticks are wired to the D-pad's and the face buttons' inputs: say so before a PlayStation game starts */
+      pending.sleep = 0;
+      pending.psx = 1;
+      prompt_toggle = 0;
+      pending.sys = (int)(s - systems);
+      snprintf(pending.rom, sizeof(pending.rom), "%s", rom);
+      snprintf(pending.core, sizeof(pending.core), "%s", core);
+      snprintf(err_title, sizeof(err_title), "The sticks are a lie");
+      snprintf(err_line1, sizeof(err_line1), "They send the same inputs as the D-pad and the A, B, X, Y buttons,");
+      snprintf(err_line2, sizeof(err_line2), "so games that need two analog sticks can't be played. We know of no way around it.");
+      mlog("launch: PlayStation sticks note for %s", rom);
+      return -3;
+   }
    mlog("launch: %s  %s", core, rom);
    if (!strncmp(rom, ROMS "/", sizeof(ROMS)))
       add_recent(rom + sizeof(ROMS));
+   bezel_write_rom(rom);
    if (!(f = fopen(GAMECFG, "w")))
    {
       mlog("launch failed: can't write " GAMECFG " (%s)", strerror(errno));
@@ -2147,6 +2463,7 @@ static struct
 /* RetroArch on its own (its config doesn't save on exit, so the G36 settings stay) */
 static int launch_retroarch(void)
 {
+   unlink("/tmp/g36-bezel.raw");
    FILE *f;
    mlog("launch: RetroArch without a game");
    if (!(f = fopen(GAMECFG, "w")))
@@ -2510,9 +2827,52 @@ static void draw_centered(canvas_t *c, font_t *f, const char *t, int cx, int y, 
    gfx_draw_text(c, f, t, cx - font_text_width(f, t) / 2, y, col, 0);
 }
 
+/* a larger favorite star with smooth edges, 24 pixels across, centred on (cx, cy): its coverage is worked out once */
+#define STAR_BIG 24
+static void fill_px(canvas_t *c, int x, int y, uint32_t col, float cov);
+static void draw_star_big(canvas_t *c, int cx, int cy, uint32_t col)
+{
+   static unsigned char mask[STAR_BIG * STAR_BIG];
+   static int made;
+   int i, j;
+   if (!made)
+   {
+      float vx[10], vy[10];
+      int k, sx, sy;
+      for (k = 0; k < 10; k++)
+      {
+         float a = -3.14159265f / 2 + k * 3.14159265f / 5, rad = (STAR_BIG / 2.0f - 0.5f) * (k & 1 ? 0.42f : 1.0f);
+         vx[k] = STAR_BIG / 2.0f + rad * cosf(a);
+         vy[k] = STAR_BIG / 2.0f + 0.6f + rad * sinf(a);
+      }
+      for (j = 0; j < STAR_BIG; j++)
+         for (i = 0; i < STAR_BIG; i++)
+         {
+            int hit = 0;
+            for (sy = 0; sy < 4; sy++)
+               for (sx = 0; sx < 4; sx++)
+               {
+                  float px = i + (sx + 0.5f) / 4, py = j + (sy + 0.5f) / 4;
+                  int inside = 0, a2, b2;
+                  for (a2 = 0, b2 = 9; a2 < 10; b2 = a2++)
+                     if ((vy[a2] > py) != (vy[b2] > py) && px < (vx[b2] - vx[a2]) * (py - vy[a2]) / (vy[b2] - vy[a2]) + vx[a2])
+                        inside = !inside;
+                  hit += inside;
+               }
+            mask[j * STAR_BIG + i] = (unsigned char)(hit * 255 / 16);
+         }
+      made = 1;
+   }
+   for (j = 0; j < STAR_BIG; j++)
+      for (i = 0; i < STAR_BIG; i++)
+         if (mask[j * STAR_BIG + i])
+            fill_px(c, cx - STAR_BIG / 2 + i, cy - STAR_BIG / 2 + j, col, mask[j * STAR_BIG + i] / 255.0f);
+}
+
 static int ft_on;   /* file transfer is on (shown in the hint bar) */
 
 static void fill_round_rect(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col);
+static void stroke_round_rect(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col);
 static void fill_px(canvas_t *c, int x, int y, uint32_t col, float cov);
 static void draw_centered(canvas_t *c, font_t *f, const char *t, int cx, int y, uint32_t col);
 /* ---- button pictures for the hint bar: A B X Y round, L R like shoulder buttons,
@@ -2520,6 +2880,17 @@ static void draw_centered(canvas_t *c, font_t *f, const char *t, int cx, int y, 
 #define BTN_INK  0xffffffff      /* what's printed on them */
 #define BTN_SHOULDER 0xff8a52b0  /* L and R */
 #define BTN_SYSTEM   0xff6a4f7e  /* Select, Start, the d-pad */
+static int glyph_raw;            /* draw the letters as given (the Controls screen) */
+/* the buttons that can be moved on the Controls screen; the first eight are the ones a game or the menu sees as its A B X Y L R
+ * Select Start, the d-pad directions can only be shortcut buttons in games */
+enum { PB_A, PB_B, PB_X, PB_Y, PB_L, PB_R, PB_SELECT, PB_START, PB_MENU, PB_UP, PB_DOWN, PB_LEFT, PB_RIGHT, PB_N };
+static const char *const pb_name[PB_N]  = { "a", "b", "x", "y", "l", "r", "select", "start", "menu", "up", "down", "left", "right" };
+static const char *const pb_glyph[PB_N] = { "A", "B", "X", "Y", "L", "R", "Select", "Start", "Menu", "Up", "Down", "<", ">" };
+static const int pb_code[PB_N] = { BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_SELECT, BTN_START,
+   KEY_MENU, KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT };
+static const int pb_ra[PB_N] = { 4, 5, 6, 7, 8, 9, 10, 11, -1, 0, 3, 1, 2 };   /* RetroArch's numbers for them: the arrows are 0..3 (up 0, left 1, right 2, down 3), then A B X Y L R Select Start; retroarch_r has the same table */
+static int menu_remapped;        /* the menu's buttons are on other ones: pictures show the ones to press */
+static unsigned char menu_m[9] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };   /* the menu's A B X Y L R Select Start Menu: which button acts as each */
 
 /* the face buttons in the classic colours: A red, B amber, X blue, Y green */
 static uint32_t face_colour(char b)
@@ -2559,6 +2930,16 @@ static int glyph_one(canvas_t *c, const char *t, int x, int cy, int draw)
 {
    font_t *bf = f_title ? f_title : f_small, *tf = f_tiny ? f_tiny : f_small;
    int w;
+   if (menu_remapped && !glyph_raw)
+   {
+      int k;
+      for (k = 0; k < 9; k++)
+         if (!strcmp(t, pb_glyph[k]))
+         {
+            t = pb_glyph[menu_m[k]];
+            break;
+         }
+   }
    if (strlen(t) == 1 && strchr("ABXY", t[0]))
    {
       /* a face button */
@@ -2666,6 +3047,10 @@ static int draw_glyphs(canvas_t *c, const char *key, int x, int cy, int draw)
  * button and what it does two apart). Each entry sits in a small box of its own; the
  * button is bright, what it does dimmer. Entries that don't fit are left off. */
 static void draw_hint_boxes(canvas_t *c, const char *hints, int x, int by, int limit);
+#define HINT_BAR_A 179   /* the hint bar's background: 70% opaque */
+static int theme_glass_bar = 1;    /* Theme card: Translucent bar On/Off (Off: a solid bar) */
+static int theme_glass_pill = 1;   /* Theme card: Translucent pill On/Off (the position dots' pill) */
+static uint32_t mix(uint32_t dst, uint32_t src, unsigned a);
 static void draw_hints_now(canvas_t *c, const char *hints);
 
 /* The bar along the bottom changes only when its words, its colours or the "File transfer on"
@@ -2688,6 +3073,11 @@ static void draw_hints(canvas_t *c, const char *hints)
    k = (k ^ C_DIM) * 16777619u;
    k = (k ^ C_ACCENT) * 16777619u;
    k = (k ^ (unsigned)c->w) * 16777619u;
+   k = (k ^ (unsigned)theme_glass_bar) * 16777619u;
+   if (menu_remapped && !glyph_raw)
+      for (y = 0; y < 9; y++)
+         k = (k ^ menu_m[y]) * 16777619u;
+   k = (k ^ (unsigned)glyph_raw) * 16777619u;
    if (c->h < 40 || c->w <= 0)
       return;
    if (!strip || strip_w != c->w)
@@ -2708,8 +3098,18 @@ static void draw_hints(canvas_t *c, const char *hints)
       draw_hints_now(&sub, hints);
       key = k;
    }
+   /* the bar's own colour is see-through (HINT_BAR_A of 255) so what is behind it shows; the buttons and the text on them
+    * are solid. The strip holds that in its alpha (made in draw_hints_now), and each frame it is blended over the bottom rows. */
    for (y = 0; y < 40; y++)
-      memcpy(c->px + (size_t)(c->h - 40 + y) * c->stride, strip + y * c->w, (size_t)c->w * 4);
+   {
+      uint32_t *dst = c->px + (size_t)(c->h - 40 + y) * c->stride, *src = strip + y * c->w;
+      int x;
+      for (x = 0; x < c->w; x++)
+      {
+         unsigned a = src[x] >> 24;
+         dst[x] = a == 255 ? src[x] : mix(dst[x], src[x] | 0xff000000, a);
+      }
+   }
 }
 
 static void draw_hints_now(canvas_t *c, const char *hints)
@@ -2717,11 +3117,27 @@ static void draw_hints_now(canvas_t *c, const char *hints)
    const char *badge = "File transfer on";
    int bw = ft_on ? font_text_width(f_small, badge) + 30 : 0;
    int by = c->h - 40 + (40 - 26) / 2;
+   int x, y;
+   uint32_t bar = TH(TH_BAR) | 0xff000000;
    gfx_fill_rect(c, 0, c->h - 40, c->w, 40, TH(TH_BAR));
    draw_hint_boxes(c, hints, 12, by, c->w - 12 - bw);
    if (ft_on)
+   {
+      /* the badge is on a solid pill like the buttons, so the cards behind the see-through bar can't cut across its words */
+      fill_round_rect(c, c->w - 20 - font_text_width(f_small, badge) - 10, by, font_text_width(f_small, badge) + 20, 26, 13, TH(TH_BAR_BOX));
       gfx_draw_text(c, f_small, badge, c->w - 20 - font_text_width(f_small, badge),
             by + (26 - font_height(f_small)) / 2, C_ACCENT, 0);
+   }
+   /* every pixel still exactly the bar's colour is bar background: make it see-through; all else stays solid */
+   for (y = c->h - 40; y < c->h; y++)
+      for (x = 0; x < c->w; x++)
+      {
+         uint32_t *px = &c->px[(size_t)y * c->stride + x];
+         if ((*px | 0xff000000) == bar)
+            *px = (bar & 0xffffff) | ((uint32_t)(theme_glass_bar ? HINT_BAR_A : 255) << 24);
+         else
+            *px |= 0xff000000;
+      }
 }
 
 /* the boxed entries alone, in a row from x with their tops at by */
@@ -2793,44 +3209,623 @@ static void fill_vgradient(canvas_t *c, int x0, int y0, int w, int h, uint32_t a
    }
 }
 
-static uint32_t *bg;   /* the background, drawn once (the cards' corners show it) */
+/* The background is made once, BG_M pixels bigger than the screen on every side, so it can be shifted (the parallax) and still
+ * cover the screen. There are two: the plain one for every screen, and the "stage" for the home screen, which adds a perspective
+ * floor with a horizon behind the cards. bg_dx/bg_dy are the shift in effect (content moves left/up for positive values),
+ * and round_corners() reads the same buffer and shift, so the cards' corners match what is behind them. */
+#define BG_M 28
+static uint32_t *bg, *bg_stage;
+static int theme_skyline = 1;    /* the stage background's skyline (Theme card: Skyline On/Off) */
+static int theme_sky_style = 1;  /* 0 city, 1 mountains, 2 forest (Theme card: Skyline style); mountains unless theme.cfg says otherwise */
+static uint32_t *ctl_bgbuf;   /* the Controls screen's backdrop (the stage background, dimmed), made once */
+static uint32_t ctl_bgkey;
+static const uint32_t *bg_cur;
+static int bg_w, bg_dx, bg_dy, bg_stage_on;
+#define BG_POOL_W    0.50f   /* the light pool behind the focused card: radii as a share of the screen's width and height */
+#define BG_POOL_H    0.62f
+#define BG_POOL      0.42f   /* its strength (a mix towards the light colour's core) */
+#define BG_VIGNETTE  0.72f   /* how much the far corners are darkened */
+#define FLOOR_HORIZON 0.47f  /* the stage's horizon, as a share of the screen's height (it's behind the focused card) */
+#define FLOOR_GRID    0.80f  /* the grid lines' strength (a mix towards the accent colour) */
 
-static void draw_background(canvas_t *c)
+/* a pixel moved part of the way (a of 0..1) towards a colour */
+static inline uint32_t bg_toward(uint32_t d, const float col[3], float a)
 {
-   int y;
-   if (bg)
-   {
-      for (y = 0; y < c->h; y++)
-         memcpy(c->px + (size_t)y * c->stride, bg + (size_t)y * c->w, (size_t)c->w * 4);
+   float r = (d >> 16 & 255) + (col[0] - (d >> 16 & 255)) * a, g = (d >> 8 & 255) + (col[1] - (d >> 8 & 255)) * a,
+         b = (d & 255) + (col[2] - (d & 255)) * a;
+   return 0xff000000 | (uint32_t)(r + 0.5f) << 16 | (uint32_t)(g + 0.5f) << 8 | (uint32_t)(b + 0.5f);
+}
+
+/* value noise along a line (0..1), the same every time */
+static float sky_lat(int i, unsigned seed)
+{
+   unsigned h = (unsigned)i * 374761393u + seed * 668265263u;
+   h = (h ^ (h >> 13)) * 1274126177u;
+   return ((h ^ (h >> 16)) & 0xffff) / 65535.0f;
+}
+
+static float sky_noise(float x, unsigned seed)
+{
+   int i = (int)floorf(x);
+   float f = x - i;
+   f = f * f * (3 - 2 * f);
+   return sky_lat(i, seed) * (1 - f) + sky_lat(i + 1, seed) * f;
+}
+
+/* The mountains style: three ranges, one behind the other, with sharp peaks (ridged noise). The far one is faint, the near one
+ * darkest; a thin rim of the accent colour runs along each ridge, and the slopes that face left are lit a little. */
+static void bg_sky_mountains(uint32_t *buf, int bw, int bh, int base, uint32_t cb, uint32_t accent)
+{
+   const float acc[3] = { accent >> 16 & 255, accent >> 8 & 255, accent & 255 };
+   /* each range is the sky behind it made darker (so it shows against the sky's glow whatever the theme) with a little accent */
+   static const float amp[3] = { 140, 112, 80 }, period[3] = { 300, 215, 150 }, dark[3] = { 0.80f, 0.68f, 0.55f };
+   (void)cb;
+   int layer, xx, yy, o;
+   int *hgt = malloc((size_t)bw * sizeof(int));
+   if (!hgt)
       return;
-   }
+   for (layer = 0; layer < 3; layer++)
    {
-      /* a dark vertical blend lit from the top middle and, more faintly, from the
-       * bottom middle (just above the hint bar). Each light is a wide soft glow
-       * with a brighter, tighter core; dithered so the shallow steps don't band */
-      uint32_t ct = TH(TH_BG_TOP), cb = TH(TH_BG_BOT), cl = TH(TH_BG_LIGHT);
-      float top[3] = { ct >> 16 & 255, ct >> 8 & 255, ct & 255 }, bot[3] = { cb >> 16 & 255, cb >> 8 & 255, cb & 255 };
-      float glow[3] = { cl >> 16 & 255, cl >> 8 & 255, cl & 255 }, core[3];
-      int q;
-      for (q = 0; q < 3; q++)
-         core[q] = glow[q] * 1.43f > 255 ? 255 : glow[q] * 1.43f;
-      const float gx = c->w * 0.5f, ty = -c->h * 0.08f, by = c->h - 40;
-      /* centre y, radii, soft strength, core radii, core strength */
-      const float L[2][7] = {
-         { ty, c->w * 0.93f, c->h * 0.95f, 0.45f, c->w * 0.45f, c->h * 0.50f, 0.55f },
-         { by, c->w * 0.825f, c->h * 0.70f, 0.32f, c->w * 0.39f, c->h * 0.34f, 0.45f } };
-      int x, k, l;
-      for (y = 0; y < c->h; y++)
-         for (x = 0; x < c->w; x++)
+      for (xx = 0; xx < bw; xx++)
+      {
+         float x = (float)(xx - BG_M) / period[layer], r = 0, a = 1;
+         for (o = 0; o < 4; o++, a *= 0.5f, x *= 2)
+            r += a * (1 - fabsf(2 * sky_noise(x, 11u + layer * 7u + o) - 1));
+         r /= 1.875f;
+         hgt[xx] = (int)(amp[layer] * powf(r, 1.7f) * 1.5f);
+         if (hgt[xx] < 6)
+            hgt[xx] = 6;
+      }
+      for (xx = 0; xx < bw; xx++)
+      {
+         int top = base - hgt[xx];
+         float slope = xx >= 4 ? (hgt[xx] - hgt[xx - 4]) / 8.0f : 0;   /* (rising to the right: a slope facing left, lit) */
+         float lit = slope < 0 ? 0 : slope > 1 ? 1 : slope;
+         for (yy = top; yy <= base; yy++)
          {
-            float col[3], d = dither(x, y);
-            uint32_t out = 0xff000000;
+            uint32_t *px;
+            float f = dark[layer], r, g, b, fade = yy - top < 18 ? 1.0f - (yy - top) / 18.0f : 0;
+            if (yy < 0 || yy >= bh)
+               continue;
+            px = &buf[(size_t)yy * bw + xx];
+            r = (*px >> 16 & 255) * f + acc[0] * 0.05f;
+            g = (*px >> 8 & 255) * f + acc[1] * 0.05f;
+            b = (*px & 255) * f + acc[2] * 0.05f;
+            r += (acc[0] - r) * 0.10f * lit * fade;
+            g += (acc[1] - g) * 0.10f * lit * fade;
+            b += (acc[2] - b) * 0.10f * lit * fade;
+            *px = 0xff000000 | (uint32_t)(r > 255 ? 255 : r) << 16 | (uint32_t)(g > 255 ? 255 : g) << 8 | (uint32_t)(b > 255 ? 255 : b);
+         }
+         if (top >= 0 && top < bh)
+            buf[(size_t)top * bw + xx] = bg_toward(buf[(size_t)top * bw + xx], acc, 0.22f);
+      }
+   }
+   free(hgt);
+}
+
+/* ---- shapes for the stage's skyline. A shape is a mask: row 0 is its bottom (where it stands), columns left to right; 0 empty,
+ * 1 body, 2 lit edge (light from the upper left), 3 shaded, 4 highlighted, 5 a lit window. */
+typedef struct { unsigned char *m; int w, h; } fmask_t;
+
+static int fm_make(fmask_t *fm, int w, int h)
+{
+   fm->w = w;
+   fm->h = h;
+   fm->m = calloc((size_t)w * h, 1);
+   return fm->m != NULL;
+}
+
+static inline void fm_put(fmask_t *fm, int r, int c, unsigned char v)
+{
+   if (r >= 0 && r < fm->h && c >= 0 && c < fm->w)
+      fm->m[(size_t)r * fm->w + c] = v;
+}
+
+static inline unsigned char fm_get(const fmask_t *fm, int r, int c)
+{
+   return r >= 0 && r < fm->h && c >= 0 && c < fm->w ? fm->m[(size_t)r * fm->w + c] : 0;
+}
+
+/* a shape put on the background: the sky or floor behind it made darker (so it shows against the glow whatever the theme), with
+ * its edges and windows in the accent colour; x0 is the column of its left side, contact the line it stands on */
+static void front_body(uint32_t *buf, int bw, int bh, const fmask_t *fm, int x0, int contact, float dark, const float acc[3],
+      const uint32_t *orig, int ref_max)
+{
+   const float lit[3] = { acc[0] * 0.85f + 38, acc[1] * 0.85f + 38, acc[2] * 0.85f + 38 };
+   int r, c;
+   for (r = 0; r < fm->h; r++)
+   {
+      int y = contact - r;
+      if (y < 0 || y >= bh)
+         continue;
+      for (c = 0; c < fm->w; c++)
+      {
+         unsigned char v = fm->m[(size_t)r * fm->w + c];
+         int xx = x0 + c;
+         uint32_t *px, src;
+         float f, cr, cg, cb;
+         if (!v || xx < 0 || xx >= bw)
+            continue;
+         px = &buf[(size_t)y * bw + xx];
+         if (orig)
+            src = orig[(size_t)(y < ref_max ? y : ref_max) * bw + xx];   /* (solid: the colour comes from the untouched sky, the floor from the horizon) */
+         else
+            src = *px;
+         f = v == 3 ? dark * 0.80f : dark;
+         cr = (src >> 16 & 255) * f + acc[0] * 0.05f;
+         cg = (src >> 8 & 255) * f + acc[1] * 0.05f;
+         cb = (src & 255) * f + acc[2] * 0.05f;
+         if (v == 2 || v == 4 || v == 5)
+         {
+            const float *to = v == 5 ? lit : acc;
+            float a = v == 2 ? 0.16f : v == 4 ? 0.10f : 0.45f;
+            cr += (to[0] - cr) * a;
+            cg += (to[1] - cg) * a;
+            cb += (to[2] - cb) * a;
+         }
+         *px = 0xff000000 | (uint32_t)(cr > 255 ? 255 : cr) << 16 | (uint32_t)(cg > 255 ? 255 : cg) << 8 | (uint32_t)(cb > 255 ? 255 : cb);
+      }
+   }
+}
+
+/* a shape that stands on the floor: the shadow it throws (to the right and flattened onto the floor, softer and fainter the
+ * higher the part that throws it) and its reflection (upside down, squashed, fading), both under the line it stands on */
+static void front_floor(uint32_t *buf, int bw, int bh, const fmask_t *fm, int x0, int contact, const float acc[3])
+{
+   const float lit[3] = { acc[0] * 0.85f + 38, acc[1] * 0.85f + 38, acc[2] * 0.85f + 38 };
+   int sw = fm->w + fm->h / 2 + 8, shh = fm->h * 16 / 100 + 4, r, c, i, j;
+   unsigned char *sh = calloc((size_t)sw * shh, 1), *bl = calloc((size_t)sw * shh, 1);
+   if (sh && bl)
+   {
+      for (r = 0; r < fm->h; r++)
+      {
+         int dy = r * 16 / 100 + 1, dx = r / 2;
+         unsigned char a = (unsigned char)(255 - r * 170 / fm->h);
+         for (c = 0; c < fm->w; c++)
+            if (fm->m[(size_t)r * fm->w + c] && dy < shh && sh[(size_t)dy * sw + c + dx] < a)
+               sh[(size_t)dy * sw + c + dx] = a;
+      }
+      for (j = 0; j < shh; j++)   /* softened: a box 7 wide along each row */
+         for (i = 0; i < sw; i++)
+         {
+            int k, sum = 0;
+            for (k = -3; k <= 3; k++)
+               if (i + k >= 0 && i + k < sw)
+                  sum += sh[(size_t)j * sw + i + k];
+            bl[(size_t)j * sw + i] = (unsigned char)(sum / 7);
+         }
+      for (j = 0; j < shh; j++)
+      {
+         int y = contact + j;
+         if (y < 0 || y >= bh)
+            continue;
+         for (i = 0; i < sw; i++)
+         {
+            unsigned char a = bl[(size_t)j * sw + i];
+            int xx = x0 + i;
+            uint32_t *px;
+            float f;
+            if (!a || xx < 0 || xx >= bw)
+               continue;
+            px = &buf[(size_t)y * bw + xx];
+            f = 1.0f - 0.50f * a / 255.0f;
+            *px = 0xff000000 | (uint32_t)((*px >> 16 & 255) * f) << 16 | (uint32_t)((*px >> 8 & 255) * f) << 8 | (uint32_t)((*px & 255) * f);
+         }
+      }
+   }
+   free(sh);
+   free(bl);
+   for (j = 1; j <= 40; j++)   /* the reflection */
+   {
+      int y = contact + j, src = j * 2;
+      float a = 0.32f * (1.0f - j / 41.0f);
+      if (y >= bh || src >= fm->h)
+         break;
+      for (c = 0; c < fm->w; c++)
+      {
+         unsigned char v = fm->m[(size_t)src * fm->w + c];
+         int xx = x0 + c;
+         uint32_t *px;
+         float cr, cg, cb;
+         if (!v || xx < 0 || xx >= bw)
+            continue;
+         px = &buf[(size_t)y * bw + xx];
+         cr = (*px >> 16 & 255) * (1 - a);
+         cg = (*px >> 8 & 255) * (1 - a);
+         cb = (*px & 255) * (1 - a);
+         if (v == 5)
+         {
+            cr += (lit[0] - cr) * a * 0.9f;
+            cg += (lit[1] - cg) * a * 0.9f;
+            cb += (lit[2] - cb) * a * 0.9f;
+         }
+         *px = 0xff000000 | (uint32_t)cr << 16 | (uint32_t)cg << 8 | (uint32_t)cb;
+      }
+   }
+}
+
+/* ---- the trees: seven stylized silhouettes (Open Clipart, public domain; tools/make_treeshapes.py made treeshapes.h from them) */
+#include "treeshapes.h"
+
+/* tree shapes, in treeshapes.h's order */
+enum { TS_ROUND, TS_PAGODA, TS_SPRUCE, TS_CYPRESS, TS_MAPLE, TS_WIDEOAK, TS_FIR };
+
+/* each shape's running totals (how many lit source pixels lie above and to the left of each point), made once: the lit pixels inside any
+ * box of the source are then four reads, so bringing a shape to a size costs only the pixels of the result */
+static unsigned short *ts_sat[TS_N];
+
+static const unsigned short *tree_shape_sat(int shape)
+{
+   int sw = ts_shape[shape].w, stride = (sw + 7) / 8, x, y;
+   if (!ts_sat[shape])
+   {
+      unsigned short *t = calloc((size_t)(sw + 1) * (TS_H + 1), sizeof(unsigned short));
+      if (!t)
+         return NULL;
+      for (y = 0; y < TS_H; y++)
+      {
+         int row = 0;
+         for (x = 0; x < sw; x++)
+         {
+            row += ts_shape[shape].bits[(size_t)y * stride + x / 8] >> (7 - x % 8) & 1;
+            t[(size_t)(y + 1) * (sw + 1) + x + 1] = (unsigned short)(t[(size_t)y * (sw + 1) + x + 1] + row);
+         }
+      }
+      ts_sat[shape] = t;
+   }
+   return ts_sat[shape];
+}
+
+static int tree_shape_width(int shape, int h)
+{
+   int w = ts_shape[shape].w * h / TS_H;
+   return w < 3 ? 3 : w;
+}
+
+/* a tree of a given shape, h pixels tall and standing with its middle at column cx, put in a mask (flipped if flip): the shape is
+ * brought to size by averaging (so a small tree keeps its overall shape), the left edge of each row and the top of each column are
+ * lit, and the right side of the tree is in shade */
+static void tree_shape_draw(fmask_t *fm, int cx, int h, int shape, int flip)
+{
+   int tw = tree_shape_width(shape, h), sw = ts_shape[shape].w, tr, tc, x0 = cx - tw / 2;
+   const unsigned short *sat = tree_shape_sat(shape);
+   unsigned char *tmp = sat ? calloc((size_t)tw * h, 1) : NULL;
+   if (!tmp)
+      return;
+   for (tr = 0; tr < h; tr++)
+   {
+      int sy0 = tr * TS_H / h, sy1 = (tr + 1) * TS_H / h;
+      if (sy1 <= sy0)
+         sy1 = sy0 + 1;
+      for (tc = 0; tc < tw; tc++)
+      {
+         int sx0 = tc * sw / tw, sx1 = (tc + 1) * sw / tw, on, area;
+         if (sx1 <= sx0)
+            sx1 = sx0 + 1;
+         area = (sy1 - sy0) * (sx1 - sx0);
+         on = sat[(size_t)sy1 * (sw + 1) + sx1] - sat[(size_t)sy0 * (sw + 1) + sx1] - sat[(size_t)sy1 * (sw + 1) + sx0] +
+              sat[(size_t)sy0 * (sw + 1) + sx0];
+         if (on * 2 >= area)
+            tmp[(size_t)tr * tw + (flip ? tw - 1 - tc : tc)] = 1;
+      }
+   }
+   for (tr = 0; tr < h; tr++)   /* shade the right side, light the left edge of each row */
+   {
+      int first = -1;
+      for (tc = 0; tc < tw; tc++)
+         if (tmp[(size_t)tr * tw + tc])
+         {
+            if (first < 0)
+            {
+               first = tc;
+               tmp[(size_t)tr * tw + tc] = 2;
+            }
+            else if (h > 40 && tc > tw * 62 / 100)
+               tmp[(size_t)tr * tw + tc] = 3;
+         }
+   }
+   for (tc = 0; tc < tw; tc++)   /* and the top of each column */
+      for (tr = 0; tr < h; tr++)
+         if (tmp[(size_t)tr * tw + tc])
+         {
+            tmp[(size_t)tr * tw + tc] = 2;
+            break;
+         }
+   for (tr = 0; tr < h; tr++)
+      for (tc = 0; tc < tw; tc++)
+         if (tmp[(size_t)tr * tw + tc])
+            fm_put(fm, h - 1 - tr, x0 + tc, tmp[(size_t)tr * tw + tc]);
+   free(tmp);
+}
+
+/* The forest style: three rows of trees, small and pale far away, bigger and darker nearer, taller and shorter in clumps, with
+ * clearings now and then. Each row is drawn as a shape first (so overlapping trees aren't darkened twice). The same every time.
+ * (The big trees in front are the skyline's front shapes, bg_sky_front.) */
+static void bg_sky_forest(uint32_t *buf, int bw, int bh, int base, uint32_t accent, const uint32_t *orig)
+{
+   const float acc[3] = { accent >> 16 & 255, accent >> 8 & 255, accent & 255 };
+   static const float dark[3] = { 0.86f, 0.72f, 0.57f };
+   static const int hmin[3] = { 30, 46, 64 }, hmax[3] = { 66, 98, 134 }, step[3] = { 6, 10, 16 };
+   /* how often each shape is chosen, in per cent, in the order of TS_ROUND ... TS_FIR: far rows are mostly conifers */
+   static const int weight[3][7] = { { 8, 5, 32, 20, 10, 0, 25 }, { 14, 10, 18, 8, 22, 8, 20 }, { 14, 14, 14, 4, 20, 16, 18 } };
+   unsigned seed = 0x51ed270bu;
+   fmask_t fm;
+   int layer, xx, r;
+#define F_RND() (seed = seed * 1664525u + 1013904223u, seed >> 12)
+   if (!fm_make(&fm, bw, 230))
+      return;
+   for (layer = 0; layer < 3; layer++)
+   {
+      int x = -8;
+      memset(fm.m, 0, (size_t)fm.w * fm.h);
+      while (x < bw + 8)
+      {
+         int h, roll = (int)(F_RND() % 100), shape, acc_w = 0, gap, flip = (int)(F_RND() & 1);
+         float clump = 0.72f + 0.56f * sky_noise((x - BG_M) / 170.0f + layer * 3, 90u + layer);
+         h = (int)((hmin[layer] + (int)(F_RND() % (unsigned)(hmax[layer] - hmin[layer]))) * clump);
+         if (h > 228)
+            h = 228;
+         for (shape = 0; shape < 6; shape++)
+         {
+            acc_w += weight[layer][shape];
+            if (roll < acc_w)
+               break;
+         }
+         tree_shape_draw(&fm, x, h, shape, flip);
+         gap = tree_shape_width(shape, h) * 35 / 100 + step[layer] / 2 + (int)(F_RND() % (unsigned)step[layer]);
+         if (layer > 0 && F_RND() % 100 < 12)
+            gap += 40 + (int)(F_RND() % 60);   /* a clearing */
+         x += gap;
+      }
+      if (layer == 2)
+         for (xx = 0; xx < bw; xx++)   /* the third row stands on a low rolling ground */
+         {
+            int hh = 7 + (int)(4 * sinf((xx - BG_M) * 0.021f + 0.7f) + 2 * sinf((xx - BG_M) * 0.063f));
+            for (r = 0; r < hh; r++)
+               fm_put(&fm, r, xx, 1);
+         }
+      front_body(buf, bw, bh, &fm, 0, base, dark[layer], acc, orig, base);
+   }
+#undef F_RND
+   free(fm.m);
+}
+
+/* The shapes that stand close, in front of everything and down on the floor beyond the horizon line: big trees (the forest),
+ * a few tall buildings (the city) or rounded hills (the mountains). Each stands on its own line a little below the horizon,
+ * is darker than anything behind it, and throws a shadow and a reflection on the floor. The same every time. */
+static void bg_sky_front(uint32_t *buf, int bw, int bh, int base, uint32_t accent, int style, const uint32_t *orig)
+{
+   const float acc[3] = { accent >> 16 & 255, accent >> 8 & 255, accent & 255 };
+   /* where each stands: across the screen (in 1000ths), how wide, how tall, and how far below the horizon line */
+   static const struct { int at, w, h, below; } city[] = { { 20, 62, 104, 16 }, { 150, 40, 68, 8 }, { 800, 50, 84, 12 }, { 955, 68, 120, 20 } };
+   static const struct { int at, w, h, below; } hills[] = { { 40, 340, 74, 26 }, { 400, 380, 50, 14 }, { 640, 300, 62, 20 }, { 930, 330, 92, 34 } };
+   static const struct { int at, shape, h, below; } trees[] = { { 30, TS_SPRUCE, 150, 22 }, { 210, TS_ROUND, 112, 12 }, { 520, TS_FIR, 128, 16 }, { 790, TS_MAPLE, 140, 20 }, { 965, TS_WIDEOAK, 150, 26 } };
+   int canvas_w = bw - 2 * BG_M, n = style == 2 ? 5 : 4, i;
+   unsigned seed = 0x7e57ab1eu;
+   for (i = 0; i < n; i++)
+   {
+      fmask_t fm;
+      int at = style == 2 ? trees[i].at : style == 1 ? hills[i].at : city[i].at, cx, x0, w, below;
+      if (style == 2)
+      {
+         w = tree_shape_width(trees[i].shape, trees[i].h) + 2;
+         below = trees[i].below;
+         if (!fm_make(&fm, w, trees[i].h + 4))
+            return;
+         tree_shape_draw(&fm, w / 2, trees[i].h, trees[i].shape, i & 1);
+      }
+      else if (style == 1)
+      {
+         int c, r, h = hills[i].h;
+         w = hills[i].w;
+         below = hills[i].below;
+         if (!fm_make(&fm, w, h + 4))
+            return;
+         for (c = 0; c < w; c++)   /* a rounded hill with a bumpy top */
+         {
+            float u = (float)c / (w - 1);
+            int top = (int)(h * powf(sinf(u * 3.14159265f), 0.7f) * (0.88f + 0.12f * sky_noise(c / 14.0f + i * 5, 40u + i)));
+            int prev = c > 0 ? (int)(h * powf(sinf((u - 1.0f / w) * 3.14159265f), 0.7f)) - 1 : -1;
+            for (r = 0; r < top; r++)
+               fm_put(&fm, r, c, r == top - 1 || r == prev ? 2 : r < top / 3 ? 3 : 1);
+         }
+      }
+      else
+      {
+         int c, r, h = city[i].h, wx, wy;
+         w = city[i].w;
+         below = city[i].below;
+         if (!fm_make(&fm, w, h + 24))
+            return;
+         for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++)
+               fm_put(&fm, r, c, r == h - 1 || c == 0 ? 2 : c > w * 3 / 4 ? 3 : 1);
+         if (w > 60)   /* a stepped top, an aerial */
+         {
+            for (r = h; r < h + 10; r++)
+               for (c = w / 4; c < w * 3 / 4; c++)
+                  fm_put(&fm, r, c, r == h + 9 || c == w / 4 ? 2 : 1);
+            for (r = h + 10; r < h + 24; r++)
+               fm_put(&fm, r, w / 2, 1);
+         }
+         for (wy = 8; wy < h - 6; wy += 8)   /* the windows, a few lit */
+            for (wx = 5; wx < w - 6; wx += 7)
+               if ((seed = seed * 1664525u + 1013904223u, seed >> 12) % 6 == 0)
+               {
+                  fm_put(&fm, wy, wx, 5);
+                  fm_put(&fm, wy, wx + 1, 5);
+                  fm_put(&fm, wy + 1, wx, 5);
+                  fm_put(&fm, wy + 1, wx + 1, 5);
+                  fm_put(&fm, wy + 2, wx, 5);
+                  fm_put(&fm, wy + 2, wx + 1, 5);
+               }
+      }
+      cx = BG_M + canvas_w * at / 1000;
+      x0 = cx - w / 2;
+      front_floor(buf, bw, bh, &fm, x0, base + below, acc);
+      front_body(buf, bw, bh, &fm, x0, base + below, 0.46f, acc, orig, base - 34);
+      free(fm.m);
+   }
+}
+
+/* The stage's skyline: along the horizon, so the sky isn't empty: a faint range of mountains behind, and in front of them a
+ * city of dark buildings (flat roofs, some stepped, some with an aerial) with a few small lit windows and a thin rim of the
+ * accent colour along each roof. The same every time (a fixed seed). The tones come from the background's own colours, so it
+ * follows the theme. */
+static void bg_skyline(uint32_t *buf, int bw, int bh, int base, uint32_t cb, uint32_t accent, int style)
+{
+   const float acc[3] = { accent >> 16 & 255, accent >> 8 & 255, accent & 255 };
+   const float far_c[3] = { (cb >> 16 & 255) * 1.00f + acc[0] * 0.16f, (cb >> 8 & 255) * 1.00f + acc[1] * 0.16f, (cb & 255) * 1.00f + acc[2] * 0.16f };
+   const float near_c[3] = { (cb >> 16 & 255) * 0.92f + acc[0] * 0.26f, (cb >> 8 & 255) * 0.92f + acc[1] * 0.26f, (cb & 255) * 0.92f + acc[2] * 0.26f };
+   const float lit[3] = { acc[0] * 0.85f + 255 * 0.15f, acc[1] * 0.85f + 255 * 0.15f, acc[2] * 0.85f + 255 * 0.15f };   /* (the theme's colour, a touch lighter) */
+   unsigned seed = 0x2545f491u;
+   int xx, yy, x;
+   size_t sky_n = (size_t)bw * (size_t)(base + 1 > bh ? bh : base + 1);
+   double tp0 = now_s(), tp1, tp2, tp3;
+   uint32_t *before = malloc(sky_n * sizeof(uint32_t));   /* (the sky as it was, to tell where the skyline went) */
+   uint32_t *orig = malloc((size_t)bw * bh * sizeof(uint32_t));   /* (the whole background as it was: solid shapes take their colour from it) */
+   if (before)
+      memcpy(before, buf, sky_n * sizeof(uint32_t));
+   if (orig)
+      memcpy(orig, buf, (size_t)bw * bh * sizeof(uint32_t));
+if (style == 1)
+      bg_sky_mountains(buf, bw, bh, base, cb, accent);
+   else if (style == 2)
+      bg_sky_forest(buf, bw, bh, base, accent, orig);
+   else
+   {
+#define SKY_RND() (seed = seed * 1664525u + 1013904223u, seed >> 10)
+   /* the mountains: a few slow waves added together */
+   for (xx = 0; xx < bw; xx++)
+   {
+      float fx = (float)(xx - BG_M);
+      int h = (int)(40 + 20 * sinf(fx * 0.0105f + 1.3f) + 12 * sinf(fx * 0.027f + 0.4f) + 6 * sinf(fx * 0.071f + 2.1f));
+      if (h < 10)
+         h = 10;
+      for (yy = base - h; yy <= base; yy++)
+         if (yy >= 0 && yy < bh)
+            buf[(size_t)yy * bw + xx] = bg_toward(buf[(size_t)yy * bw + xx], far_c, yy == base - h ? 0.45f : 0.72f);
+   }
+   /* the city */
+   x = 0;
+   while (x < bw)
+   {
+      int w = 14 + (int)(SKY_RND() % 26), h = 24 + (int)(SKY_RND() % 66), step = SKY_RND() % 4 == 0, aerial = SKY_RND() % 6 == 0;
+      int gap = (int)(SKY_RND() % 5), wx, wy, top;
+      if (SKY_RND() % 8 == 0)
+         h += 38;   /* now and then a tower */
+      top = base - h;
+      for (xx = x; xx < x + w && xx < bw; xx++)
+         for (yy = top; yy <= base; yy++)
+            if (yy >= 0 && yy < bh)
+               buf[(size_t)yy * bw + xx] = bg_toward(buf[(size_t)yy * bw + xx], near_c, yy == top ? 0.55f : 0.94f);
+      for (xx = x; xx < x + w && xx < bw; xx++)   /* the rim of light along the roof */
+         if (top > 0 && top < bh)
+            buf[(size_t)top * bw + xx] = bg_toward(buf[(size_t)top * bw + xx], acc, 0.16f);
+      if (step && w > 16)
+      {
+         int sx = x + w / 4, sw = w / 2, sh = 8 + (int)(SKY_RND() % 8);
+         for (xx = sx; xx < sx + sw && xx < bw; xx++)
+            for (yy = top - sh; yy < top; yy++)
+               if (yy >= 0 && yy < bh)
+                  buf[(size_t)yy * bw + xx] = bg_toward(buf[(size_t)yy * bw + xx], near_c, yy == top - sh ? 0.55f : 0.94f);
+         if (top - sh > 0 && top - sh < bh)
+            for (xx = sx; xx < sx + sw && xx < bw; xx++)
+               buf[(size_t)(top - sh) * bw + xx] = bg_toward(buf[(size_t)(top - sh) * bw + xx], acc, 0.16f);
+      }
+      if (aerial)
+         for (yy = top - 14 - step * 8; yy < top - step * 8 && yy >= 0; yy++)
+            if (x + w / 2 < bw)
+               buf[(size_t)yy * bw + x + w / 2] = bg_toward(buf[(size_t)yy * bw + x + w / 2], near_c, 0.9f);
+      /* a few windows lit, in rows */
+      for (wy = top + 6; wy < base - 4; wy += 6)
+         for (wx = x + 3; wx < x + w - 4; wx += 5)
+            if (SKY_RND() % 11 == 0 && wx + 2 < bw)
+               for (yy = wy; yy < wy + 3; yy++)
+                  for (xx = wx; xx < wx + 2; xx++)
+                     if (yy >= 0 && yy < bh)
+                        buf[(size_t)yy * bw + xx] = bg_toward(buf[(size_t)yy * bw + xx], lit, 0.30f);
+      x += w + gap;
+   }
+#undef SKY_RND
+   }
+   tp1 = now_s();
+   /* its reflection on the floor: the skyline upside down, squashed, and only just there, fading with distance */
+   if (before)
+   {
+      for (yy = 1; yy <= 44 && base + yy < bh; yy++)
+      {
+         int sy = base - yy * 2;
+         float a = 0.5f * (1.0f - yy / 46.0f);
+         if (sy < 0)
+            break;
+         for (xx = 0; xx < bw; xx++)
+         {
+            uint32_t now_px = buf[(size_t)sy * bw + xx];
+            if (now_px != before[(size_t)sy * bw + xx])
+            {
+               float col[3] = { (now_px >> 16 & 255) * 0.7f, (now_px >> 8 & 255) * 0.7f, (now_px & 255) * 0.7f };
+               buf[(size_t)(base + yy) * bw + xx] = bg_toward(buf[(size_t)(base + yy) * bw + xx], col, a);
+            }
+         }
+      }
+      free(before);
+   }
+   tp2 = now_s();
+   bg_sky_front(buf, bw, bh, base, accent, style, orig);
+   tp3 = now_s();
+   mlog("skyline style %d: horizon %d ms, reflection %d ms, front %d ms", style, (int)((tp1 - tp0) * 1000), (int)((tp2 - tp1) * 1000), (int)((tp3 - tp2) * 1000));
+   free(orig);
+}
+
+static uint32_t *bg_build(const canvas_t *c, int stage)
+{
+   /* a dark vertical blend lit from the top middle and, more faintly, from the
+    * bottom middle (just above the hint bar). Each light is a wide soft glow
+    * with a brighter, tighter core; dithered so the shallow steps don't band */
+   uint32_t ct = TH(TH_BG_TOP), cb = TH(TH_BG_BOT), cl = TH(TH_BG_LIGHT);
+   float top[3] = { ct >> 16 & 255, ct >> 8 & 255, ct & 255 }, bot[3] = { cb >> 16 & 255, cb >> 8 & 255, cb & 255 };
+   float glow[3] = { cl >> 16 & 255, cl >> 8 & 255, cl & 255 }, core[3];
+   int q, bw = c->w + 2 * BG_M, bh = c->h + 2 * BG_M, x, y, k, l;
+   uint32_t *out_buf = malloc((size_t)bw * bh * 4);
+   double t_start = now_s();
+   const float gx = c->w * 0.5f, ty = -c->h * 0.08f, by = c->h - 40, yh = c->h * FLOOR_HORIZON;
+   /* centre y, radii, soft strength, core radii, core strength */
+   const float L[2][7] = {
+      { ty, c->w * 0.93f, c->h * 0.95f, 0.45f, c->w * 0.45f, c->h * 0.50f, 0.55f },
+      { by, c->w * 0.825f, c->h * 0.70f, 0.32f, c->w * 0.39f, c->h * 0.34f, 0.45f } };
+   if (!out_buf)
+      return NULL;
+   for (q = 0; q < 3; q++)
+      core[q] = glow[q] * 1.43f > 255 ? 255 : glow[q] * 1.43f;
+   /* the lights, the pool and the vignette are smooth, so they're worked out on a coarse grid (every BG_STEP px) and
+    * interpolated; the horizon's glow, the floor's tone (both depend on the row alone), the grid lines and the dither
+    * are done per pixel */
+   {
+      enum { BG_STEP = 8 };
+      int nx = bw / BG_STEP + 2, ny = bh / BG_STEP + 2, i, j;
+      float *base = malloc((size_t)nx * ny * 3 * sizeof(float)), *rb = malloc((size_t)nx * 3 * sizeof(float));
+      const uint32_t ac = C_ACCENT;
+      const float acc[3] = { ac >> 16 & 255, ac >> 8 & 255, ac & 255 };
+      if (!base || !rb)
+      {
+         free(base);
+         free(rb);
+         free(out_buf);
+         return NULL;
+      }
+      for (j = 0; j < ny; j++)
+         for (i = 0; i < nx; i++)
+         {
+            int xs = -BG_M + i * BG_STEP, ys = -BG_M + j * BG_STEP;
+            float col[3], *o = base + ((size_t)j * nx + i) * 3;
+            int yc = ys < 0 ? 0 : ys >= c->h ? c->h - 1 : ys;
             for (k = 0; k < 3; k++)
-               col[k] = top[k] + (bot[k] - top[k]) * ((float)y / c->h);
+               col[k] = top[k] + (bot[k] - top[k]) * ((float)yc / c->h);
             for (l = 0; l < 2; l++)
             {
-               float dx = (x - gx) / L[l][1], dy = (y - L[l][0]) / L[l][2];
-               float cx = (x - gx) / L[l][4], cy = (y - L[l][0]) / L[l][5];
+               float dx = (xs - gx) / L[l][1], dy = (ys - L[l][0]) / L[l][2];
+               float cx = (xs - gx) / L[l][4], cy = (ys - L[l][0]) / L[l][5];
                float a = 1 - (dx * dx + dy * dy), b = 1 - (cx * cx + cy * cy);
                a = a > 0 ? a * a * L[l][3] : 0;
                b = b > 0 ? b * b * L[l][6] : 0;
@@ -2840,15 +3835,106 @@ static void draw_background(canvas_t *c)
                   col[k] += (core[k] - col[k]) * b;
                }
             }
+            /* depth, like the cards': a pool of light (the stage the focused card stands in) a little up and to the left,
+             * and a vignette that darkens the edges and corners, so the screen reads as a space with the cards in front */
+            {
+               float qx = (xs - gx * 0.96f) / (c->w * BG_POOL_W), qy = (ys - c->h * 0.46f) / (c->h * BG_POOL_H);
+               float r2 = qx * qx + qy * qy, pool = 1 - r2, vt = (r2 - 0.30f) / 1.2f, vig;
+               pool = pool > 0 ? pool * pool * BG_POOL : 0;
+               vt = vt < 0 ? 0 : vt > 1 ? 1 : vt;
+               vig = vt * vt * (3 - 2 * vt) * BG_VIGNETTE;
+               for (k = 0; k < 3; k++)
+               {
+                  col[k] += (core[k] - col[k]) * pool;
+                  o[k] = col[k] * (1 - vig);
+               }
+            }
+         }
+      for (y = -BG_M; y < c->h + BG_M; y++)
+      {
+         int yy = y + BG_M, y0 = yy / BG_STEP;
+         float fy = (yy % BG_STEP) / (float)BG_STEP, dyh = y - yh, glowh = 1.0f - fabsf(dyh) / 34.0f, gk = 0, fk = 0;
+         float spx = 0, ispx = 0, dzl = 0, lfade = 0;
+         const float *r0 = base + (size_t)y0 * nx * 3, *r1 = r0 + (size_t)nx * 3;
+         for (i = 0; i < nx * 3; i++)
+            rb[i] = r0[i] + (r1[i] - r0[i]) * fy;
+         if (stage)
+         {
+            /* a floor below the horizon: darker, with a perspective grid (lines that meet at the horizon, spaced
+             * further apart the nearer they are) fading out towards the horizon, and a thin bright glow along the
+             * horizon itself (in the accent) */
+            float fade;
+            gk = glowh > 0 ? glowh * glowh * 0.75f : 0;
+            if (dyh > 0)
+            {
+               /* the lines along the depth meet at the horizon's middle: their spacing on a row grows with the distance
+                * from the horizon (0.9 px per px of dyh). The lines across are at equal steps of depth z = K / dyh, so
+                * their spacing on screen is Sz * dyh^2 / K. */
+               const float K = 3000.0f, Sz = 6.0f;
+               float z = K / dyh;
+               spx = 0.9f * dyh;
+               ispx = 1 / spx;
+               dzl = fabsf(z / Sz - floorf(z / Sz + 0.5f)) * Sz * dyh * dyh / K;
+               fade = dyh / (c->h * 0.16f);
+               fade = fade > 1 ? 1 : fade;
+               lfade = dyh / (c->h * 0.30f);
+               lfade = lfade > 1 ? 1 : lfade;
+               fk = 0.62f * fade;   /* the floor itself: a deep tone of the accent, clearly apart from the lit sky above */
+            }
+         }
+         for (x = -BG_M; x < c->w + BG_M; x++)
+         {
+            int xx = x + BG_M, i0 = xx / BG_STEP;
+            float fx = (xx % BG_STEP) / (float)BG_STEP, d = dither(x & 1023, y & 1023), col[3];
+            const float *p0 = rb + i0 * 3;
+            uint32_t out = 0xff000000;
+            for (k = 0; k < 3; k++)
+               col[k] = p0[k] + (p0[k + 3] - p0[k]) * fx;
+            if (gk > 0)
+               for (k = 0; k < 3; k++)
+                  col[k] += (acc[k] - col[k]) * gk;
+            if (fk > 0)
+            {
+               float u = (x - gx) * ispx, dxl = fabsf(u - floorf(u + 0.5f)) * spx, line = 1.0f - (dxl < dzl ? dxl : dzl) / 1.8f;
+               for (k = 0; k < 3; k++)
+                  col[k] += (acc[k] * 0.28f - col[k]) * fk;
+               if (line > 0)
+                  for (k = 0; k < 3; k++)
+                     col[k] += (acc[k] - col[k]) * line * lfade * FLOOR_GRID;
+            }
             for (k = 0; k < 3; k++)
                out |= (uint32_t)(col[k] + d > 255 ? 255 : col[k] + d) << (16 - 8 * k);
-            c->px[(size_t)y * c->stride + x] = out;
+            out_buf[(size_t)yy * bw + xx] = out;
          }
+      }
+      free(base);
+      free(rb);
    }
-   /* keep it, so later frames just copy it */
-   if ((bg = malloc((size_t)c->w * c->h * 4)))
-      for (y = 0; y < c->h; y++)
-         memcpy(bg + (size_t)y * c->w, c->px + (size_t)y * c->stride, (size_t)c->w * 4);
+   if (stage && theme_skyline)
+      bg_skyline(out_buf, bw, bh, (int)yh + BG_M, cb, C_ACCENT, theme_sky_style);
+   mlog("background %s built in %d ms", stage ? "stage" : "plain", (int)((now_s() - t_start) * 1000));
+   return out_buf;
+}
+
+static void draw_background(canvas_t *c)
+{
+   uint32_t **slot = bg_stage_on ? &bg_stage : &bg;
+   int y, dx = bg_dx, dy = bg_dy;
+   if (!*slot)
+      *slot = bg_build(c, bg_stage_on);
+   if (!*slot)
+   {
+      gfx_clear(c, TH(TH_BG_TOP));
+      return;
+   }
+   bg_cur = *slot;
+   bg_w = c->w + 2 * BG_M;
+   dx = dx < -BG_M ? -BG_M : dx > BG_M ? BG_M : dx;
+   dy = dy < -BG_M ? -BG_M : dy > BG_M ? BG_M : dy;
+   bg_dx = dx;
+   bg_dy = dy;
+   for (y = 0; y < c->h; y++)
+      memcpy(c->px + (size_t)y * c->stride, bg_cur + (size_t)(y + BG_M + dy) * bg_w + BG_M + dx, (size_t)c->w * 4);
 }
 
 /* where item i sits relative to the row's animated position, looping: -n/2 .. n/2 */
@@ -2908,6 +3994,7 @@ static void row_item(int r, int i, char *name, size_t nsz, char *sub, size_t ssz
 
 /* ------------------------------------------------------------- status */
 
+static int bat_low;   /* on the battery and at or under the warning level: the stars twinkle more slowly (fewer frames) */
 static int st_battery = -1, st_power;   /* refreshed every few seconds in the main loop */
 /* ---- the click when you scroll: the factory menu's own sound (keytone.wav: a 4-byte
  * length, then 16-bit stereo samples at 8000 Hz), played from a small thread so the
@@ -3138,39 +4225,512 @@ static void draw_volume(canvas_t *c, double now)
    gfx_draw_text(c, f_small, t, x + 252, y + (h - font_height(f_small)) / 2, C_TEXT, 0);
 }
 
-/* hold Start: every button, in the menu and in a game */
+/* ---- Controls: the old two columns, as lists you move around in (Controls card, or Y on the home screen) ----
+ * Left: the buttons in the menu. Right: the buttons in a game, for the console picked with L / R ("All consoles" first; a
+ * console without a page of its own follows it). Each row shows the real button that does it; A on a row, then press the
+ * button you want. Saved in g36/remap.cfg, one line per page:
+ *    menu pad=a,b,x,y,l,r,select,start,menu
+ *    <* or console id> pad=a,b,x,y,l,r,select,start,menu hot=select,b,r,l,x,a,left,right
+ * pad: the button that acts as the A B X Y L R Select Start Menu (the menu's, or the game's; the last is the menu button's job:
+ * video options in the menu, RetroArch's menu in a game; a line with only eight is the same with Menu on Menu); hot: the hold button, then the
+ * buttons for quit, save state, load state, fast-forward, pause, save slot down, save slot up. The menu line is applied to
+ * every press in the menu (input.c); for a game, retroarch_r turns the console's line into a changed copy of the controller's
+ * autoconfig and hotkey settings. */
+#define REMAP_FILE SDCARD "/g36/remap.cfg"
+typedef struct { char scope[32]; unsigned char pad[9], hk[8]; int dev; } remap_t;   /* dev: the controller type told to the emulator, 0 = leave it */
+#define DEV_DUALSHOCK 517   /* the PlayStation core's DualShock (1 standard, 261 analog, 517 dualshock, 773 negcon) */
+static remap_t remap_tab[MAX_SYSTEMS + 2];
+static int remap_n;
+static const unsigned char hk_default[8] = { PB_SELECT, PB_B, PB_R, PB_L, PB_X, PB_A, PB_LEFT, PB_RIGHT };
+static const char *const hk_label[8] = { "Hold for the shortcuts", "Quit the game", "Save state", "Load state", "Fast-forward on / off",
+   "Pause", "Save slot down", "Save slot up" };
+
+typedef struct { int kind; int id; char label[40], key[24]; } ctl_item_t;   /* kind: 0 menu button, 1 game button, 2 shortcut, 3 fixed, 4 controller type */
+static struct
+{
+   int page[MAX_SYSTEMS + 2], npage, pi;      /* page: -1 all consoles, else a console's index */
+   int col, row[2], top[2], capture;
+   double capture_until;   /* when waiting for a button gives up */
+   ctl_item_t it[2][24];
+   int n[2], nsel[2];
+} rm;
+
+static int pb_find(const char *name)
+{
+   int i;
+   for (i = 0; i < PB_N; i++)
+      if (!strcmp(pb_name[i], name))
+         return i;
+   return -1;
+}
+
+static int remap_find(const char *scope)
+{
+   int i;
+   for (i = 0; i < remap_n; i++)
+      if (!strcmp(remap_tab[i].scope, scope))
+         return i;
+   return -1;
+}
+
+/* "a,b,x,..." -> button numbers; 1 if there are n of them, all different, each below lim */
+static int remap_list(const char *v, unsigned char *out, int n, int lim)
+{
+   char tmp[100], *tok, *sp = NULL;
+   int k = 0, seen = 0;
+   snprintf(tmp, sizeof(tmp), "%s", v);
+   for (tok = strtok_r(tmp, ",", &sp); tok && k < n; tok = strtok_r(NULL, ",", &sp), k++)
+   {
+      int b = pb_find(tok);
+      if (b < 0 || b >= lim || (seen >> b & 1))
+         return 0;
+      seen |= 1 << b;
+      out[k] = (unsigned char)b;
+   }
+   return k == n && !tok;
+}
+
+static void remap_load(void)
+{
+   FILE *f = fopen(REMAP_FILE, "r");
+   char line[300];
+   remap_n = 0;
+   if (!f)
+      return;
+   while (fgets(line, sizeof(line), f) && remap_n < MAX_SYSTEMS + 2)
+   {
+      char *tok, *sp = NULL;
+      remap_t e;
+      int havepad = 0;
+      if (line[0] == '#' || !(tok = strtok_r(line, " \t\r\n", &sp)) || strlen(tok) >= sizeof(e.scope))
+         continue;
+      memset(&e, 0, sizeof(e));
+      snprintf(e.scope, sizeof(e.scope), "%s", tok);
+      memcpy(e.hk, hk_default, 8);
+      while ((tok = strtok_r(NULL, " \t\r\n", &sp)))
+      {
+         if (!strncmp(tok, "pad=", 4))
+         {
+            havepad = remap_list(tok + 4, e.pad, 9, 9);
+            if (!havepad && remap_list(tok + 4, e.pad, 8, 8))
+            {
+               e.pad[8] = PB_MENU;
+               havepad = 1;
+            }
+         }
+         else if (!strncmp(tok, "hot=", 4))
+         {
+            int q, bad = !remap_list(tok + 4, e.hk, 8, PB_N);
+            for (q = 0; q < 8; q++)
+               if (e.hk[q] == PB_MENU)
+                  bad = 1;   /* (the menu button can't be a shortcut button) */
+            if (bad)
+               memcpy(e.hk, hk_default, 8);
+         }
+         else if (!strncmp(tok, "dev=", 4))
+            e.dev = atoi(tok + 4);
+      }
+      if (havepad && remap_find(e.scope) < 0)
+         remap_tab[remap_n++] = e;
+   }
+   fclose(f);
+}
+
+static void remap_save(void)
+{
+   char tmp[300];
+   FILE *f;
+   int i, k;
+   snprintf(tmp, sizeof(tmp), "%s.tmp", REMAP_FILE);
+   if (!(f = fopen(tmp, "w")))
+      return;
+   fprintf(f, "# Controls screen. One line per page: menu, * (all consoles) or a console id; pad = the button that acts as\n");
+   fprintf(f, "# A B X Y L R Select Start Menu; hot = hold button, quit, save state, load state, fast-forward, pause, slot down, slot up.\n");
+   for (i = 0; i < remap_n; i++)
+   {
+      fprintf(f, "%s pad=", remap_tab[i].scope);
+      for (k = 0; k < 9; k++)
+         fprintf(f, "%s%s", k ? "," : "", pb_name[remap_tab[i].pad[k]]);
+      if (strcmp(remap_tab[i].scope, "menu"))
+      {
+         fprintf(f, " hot=");
+         for (k = 0; k < 8; k++)
+            fprintf(f, "%s%s", k ? "," : "", pb_name[remap_tab[i].hk[k]]);
+         if (remap_tab[i].dev)
+            fprintf(f, " dev=%d", remap_tab[i].dev);
+      }
+      fprintf(f, "\n");
+   }
+   fflush(f);
+   fsync(fileno(f));
+   fclose(f);
+   rename(tmp, REMAP_FILE);
+}
+
+/* the menu's buttons are changed in input.c, and the hint bar shows the real ones */
+static void menu_map_apply(void)
+{
+   int i = remap_find("menu"), k, real[9];
+   for (k = 0; k < 9; k++)
+      menu_m[k] = (unsigned char)(i >= 0 ? remap_tab[i].pad[k] : k);
+   menu_remapped = 0;
+   for (k = 0; k < 9; k++)
+   {
+      real[k] = pb_code[menu_m[k]];
+      if (menu_m[k] != k)
+         menu_remapped = 1;
+   }
+   input_set_map(menu_remapped ? real : NULL);
+}
+
+static const char *ctl_scope(int col)
+{
+   return col == 0 ? "menu" : rm.page[rm.pi] < 0 ? "*" : systems[rm.page[rm.pi]].id;
+}
+
+/* what a list uses now: its own line, else (a console) the all-consoles line, else nothing changed; 1 when it has its own */
+static int remap_effective(int col, unsigned char pad[9], unsigned char hk[8])
+{
+   int i = remap_find(ctl_scope(col)), own = i >= 0, k;
+   if (i < 0 && col == 1 && rm.page[rm.pi] >= 0)
+      i = remap_find("*");
+   for (k = 0; k < 9; k++)
+      pad[k] = (unsigned char)(i >= 0 ? remap_tab[i].pad[k] : k);
+   for (k = 0; k < 8; k++)
+      hk[k] = i >= 0 ? remap_tab[i].hk[k] : hk_default[k];
+   return own;
+}
+
+static void remap_set(int col, const unsigned char pad[9], const unsigned char hk[8])
+{
+   int i = remap_find(ctl_scope(col));
+   if (i < 0)
+   {
+      if (remap_n >= MAX_SYSTEMS + 2)
+         return;
+      i = remap_n++;
+      memset(&remap_tab[i], 0, sizeof(remap_tab[i]));
+      snprintf(remap_tab[i].scope, sizeof(remap_tab[i].scope), "%s", ctl_scope(col));
+   }
+   memcpy(remap_tab[i].pad, pad, 9);
+   memcpy(remap_tab[i].hk, hk, 8);
+   remap_save();
+   menu_map_apply();
+}
+
+/* the controller type set for this console's own page (0 = standard) */
+static int remap_dev(void)
+{
+   int i = remap_find(ctl_scope(1));
+   return i >= 0 ? remap_tab[i].dev : 0;
+}
+
+static void remap_dev_toggle(void)
+{
+   unsigned char pad[9], hk[8];
+   int i, v = remap_dev() ? 0 : DEV_DUALSHOCK;
+   remap_effective(1, pad, hk);
+   if (remap_find(ctl_scope(1)) < 0)
+      remap_set(1, pad, hk);
+   if ((i = remap_find(ctl_scope(1))) >= 0)
+   {
+      remap_tab[i].dev = v;
+      remap_save();
+   }
+}
+
+static void ctl_add(int col, int kind, int id, const char *label, const char *key)
+{
+   ctl_item_t *e = &rm.it[col][rm.n[col]++];
+   e->kind = kind;
+   e->id = id;
+   snprintf(e->label, sizeof(e->label), "%s", label);
+   snprintf(e->key, sizeof(e->key), "%s", key ? key : "");
+}
+
+/* the rows of both lists; the ones you can change come first */
+static void ctl_build(void)
+{
+   static const char *const menu_what[9] = { "Open / play", "Back", "Search", "Favorite", "Previous letter", "Next letter",
+      "All Games", "Search matches / remove recent", "Video options" };
+   static const char *const two[] = { "nes", "famicom", "fds", "gb", "gbc", "mastersystem", "gamegear", "sg-1000", "atari2600",
+      "atari5200", "atari7800", "atarilynx", "pcengine", "tg16", "pcenginecd", "ngp", "ngpc", NULL };
+   int k, kind = 0, sc = rm.page[rm.pi];
+   char lab[40];
+   rm.n[0] = rm.n[1] = 0;
+   for (k = 0; k < 9; k++)
+      ctl_add(0, 0, k, menu_what[k], NULL);
+   rm.nsel[0] = rm.n[0];
+   ctl_add(0, 3, 0, "Move", "D-pad");
+   ctl_add(0, 3, 0, "Choose the emulator", "Hold Select + A");
+   ctl_add(0, 3, 0, "Screen off / on", "Tap Power");
+   ctl_add(0, 3, 0, "Power off / restart", "Hold Power");
+   ctl_add(0, 3, 0, "Volume", "Vol + / -");
+   if (sc >= 0)
+   {
+      const char *id = systems[sc].id;
+      for (k = 0; two[k]; k++)
+         if (!strcmp(id, two[k]))
+            kind = 1;
+      if (!strcmp(id, "gba"))
+         kind = 2;
+   }
+   for (k = 0; k < 8; k++)
+      if (kind == 0 || (kind == 1 && (k < 2 || k > 5)) || (kind == 2 && k != 2 && k != 3))
+      {
+         snprintf(lab, sizeof(lab), "The game's %c%s", k < 6 ? "ABXYLR"[k] : ' ', k == 6 ? "Select" : k == 7 ? "Start" : "");
+         if (k >= 6)
+            snprintf(lab, sizeof(lab), "The game's %s", k == 6 ? "Select" : "Start");
+         ctl_add(1, 1, k, lab, NULL);
+      }
+   ctl_add(1, 1, 8, "RetroArch's menu", NULL);
+   for (k = 0; k < 8; k++)
+      ctl_add(1, 2, k, hk_label[k], NULL);
+   if (sc >= 0 && !strcmp(systems[sc].id, "psx"))
+      ctl_add(1, 4, 0, "Controller type", NULL);
+   rm.nsel[1] = rm.n[1];
+   ctl_add(1, 3, 0, "Move", "D-pad");
+   ctl_add(1, 3, 0, "Save and power off", "Hold Power");
+   for (k = 0; k < 2; k++)
+      if (rm.row[k] >= rm.nsel[k])
+         rm.row[k] = rm.nsel[k] - 1;
+}
+
+static int controls_open(void)
+{
+   int i;
+   remap_load();
+   rm.npage = 0;
+   rm.page[rm.npage++] = -1;
+   for (i = 0; i < nsystems; i++)
+      if (systems[i].count > 0)
+         rm.page[rm.npage++] = i;
+   rm.pi = rm.col = rm.capture = 0;
+   rm.row[0] = rm.row[1] = rm.top[0] = rm.top[1] = 0;
+   ctl_build();
+   input_set_raw(1);
+   return 1;
+}
+
+/* the item row i of a list uses button b now */
+static void remap_assign(int col, const ctl_item_t *e, int b)
+{
+   unsigned char pad[9], hk[8];
+   int k;
+   remap_effective(col, pad, hk);
+   if (e->kind == 2)
+   {
+      for (k = 0; k < 8; k++)
+         if (k != e->id && hk[k] == b)
+         {
+            hk[k] = hk[e->id];
+            break;
+         }
+      hk[e->id] = (unsigned char)b;
+   }
+   else
+   {
+      for (k = 0; k < 9; k++)
+         if (k != e->id && pad[k] == b)
+         {
+            pad[k] = pad[e->id];
+            break;
+         }
+      pad[e->id] = (unsigned char)b;
+   }
+   remap_set(col, pad, hk);
+}
+
+#define CTL_VIS 14
+#define CTL_TIMEOUT 5   /* seconds to press the button you want before the change is dropped */
+/* a real button press on the Controls screen; returns 1 when the screen should close */
+static int remap_key(int code)
+{
+   int c = rm.col, b, k;
+   if (rm.capture)
+   {
+      const ctl_item_t *e = &rm.it[c][rm.row[c]];
+      /* (the Menu button can be chosen like the others; with no button for CTL_TIMEOUT seconds the change is dropped) */
+      for (b = 0; b < PB_N; b++)
+         if (code == pb_code[b] && (e->kind == 2 ? b != PB_MENU : b <= PB_MENU))
+         {
+            remap_assign(c, e, b);
+            rm.capture = 0;
+         }
+      return 0;
+   }
+   if (code == BTN_EAST)
+   {
+      input_set_raw(0);
+      return 1;
+   }
+   if (code == KEY_UP && rm.row[c] > 0)
+      rm.row[c]--;
+   else if (code == KEY_DOWN && rm.row[c] < rm.nsel[c] - 1)
+      rm.row[c]++;
+   else if (code == KEY_LEFT || code == KEY_RIGHT)
+      rm.col = code == KEY_LEFT ? 0 : 1;
+   else if ((code == BTN_TL || code == BTN_TR) && rm.npage > 1)
+   {
+      rm.pi = (rm.pi + (code == BTN_TL ? rm.npage - 1 : 1)) % rm.npage;
+      rm.top[1] = 0;
+      ctl_build();
+   }
+   else if (code == BTN_SOUTH && rm.it[c][rm.row[c]].kind == 4)
+      remap_dev_toggle();
+   else if (code == BTN_SOUTH)
+   {
+      rm.capture = 1;
+      rm.capture_until = now_s() + CTL_TIMEOUT;
+   }
+   else if (code == BTN_START || code == KEY_MENU)
+   {
+      int i = remap_find(ctl_scope(c));
+      if (i >= 0)
+      {
+         memmove(&remap_tab[i], &remap_tab[i + 1], (size_t)(remap_n - i - 1) * sizeof(remap_t));
+         remap_n--;
+         remap_save();
+         menu_map_apply();
+      }
+   }
+   if (rm.row[c] < rm.top[c])
+      rm.top[c] = rm.row[c];
+   if (rm.row[c] >= rm.top[c] + CTL_VIS)
+      rm.top[c] = rm.row[c] - CTL_VIS + 1;
+   for (k = 0; k < 2; k++)
+      if (rm.n[k] <= CTL_VIS)
+         rm.top[k] = 0;
+   return 0;
+}
+
+static inline uint32_t blend256(uint32_t d, uint32_t s, unsigned a);
+static void draw_title_pill(canvas_t *c, const char *title, int cx, int py0);
+static void fill_round_rect_alpha(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col, int alpha);
+
 static void draw_controls(canvas_t *c)
 {
-   static const char *const menu[][2] = {
-      { "A", "Open / play" }, { "B", "Back" }, { "D-pad", "Move" },
-      { "L / R", "Previous / next letter" }, { "Y", "Favorite (home: controls)" },
-      { "X", "Search" }, { "Select", "All Games" },
-      { "Hold Select + A", "Choose the emulator" }, { "Tap Power", "Screen off / on" },
-      { "Hold Power", "Power off / restart" }, { "Vol + / -", "Volume" },
-      { "Menu", "Video options" },
-   };
-   static const char *const game[][2] = {
-      { "Select + B", "Quit the game" }, { "Select + R", "Save state" },
-      { "Select + L", "Load state" }, { "Select + < >", "Save-state slot" },
-      { "Select + X", "Fast-forward on / off" }, { "Select + A", "Pause" },
-      { "Menu", "RetroArch menu" }, { "Hold Power", "Save and power off" },
-   };
-   int i, y0 = 70, rh = 29;
-   gfx_fill_rect(c, 0, 0, c->w, c->h, 0xff190f1d);
-   draw_centered(c, f_big, "Controls", c->w / 2, 16, C_TEXT);
-   gfx_draw_text(c, f_small, "IN THE MENU", 30, y0 - 4, C_ACCENT, 0);
-   gfx_draw_text(c, f_small, "IN A GAME", 460, y0 - 4, C_ACCENT, 0);
-   for (i = 0; i < (int)(sizeof(menu) / sizeof(*menu)); i++)
+   unsigned char pad[2][9], hk[2][8];
+   int own[2], col, i, sc = rm.page[rm.pi], cx0[2] = { 30, 450 }, rt[2] = { 418, 828 }, y0 = 114, rh = 22;
+   char num[24];
+   const char *name = sc < 0 ? "All consoles" : systems[sc].name;
+   glyph_raw = 1;
+   own[0] = remap_effective(0, pad[0], hk[0]);
+   own[1] = remap_effective(1, pad[1], hk[1]);
    {
-      gfx_draw_text(c, f_small, menu[i][0], 30, y0 + 26 + i * rh, C_TEXT, 150);
-      gfx_draw_text(c, f_small, menu[i][1], 180, y0 + 26 + i * rh, C_DIM, 250);
+      /* behind it: the home screen's background without the cards, under a dark filter at 75%. The result is kept, so a frame is
+       * one copy; it is made again when the theme's colours or the screen size change. */
+      size_t n = (size_t)c->w * c->h;
+      uint32_t key = (uint32_t)c->w * 2654435761u ^ (uint32_t)c->h * 40503u ^ TH(TH_BG_TOP) ^ TH(TH_BG_BOT) * 31u;
+      if (!ctl_bgbuf || ctl_bgkey != key)
+      {
+         int bdx = bg_dx, bdy = bg_dy, x, y;
+         free(ctl_bgbuf);
+         ctl_bgbuf = malloc(n * 4);
+         bg_dx = bg_dy = 0;
+         bg_stage_on = 1;
+         draw_background(c);
+         bg_stage_on = 0;
+         bg_dx = bdx;
+         bg_dy = bdy;
+         if (ctl_bgbuf)
+         {
+            for (y = 0; y < c->h; y++)
+            {
+               uint32_t *row = c->px + (size_t)y * c->stride;
+               for (x = 0; x < c->w; x++)
+                  row[x] = blend256(row[x], 0xff190f1d, 192);
+               memcpy(ctl_bgbuf + (size_t)y * c->w, row, (size_t)c->w * 4);
+            }
+            ctl_bgkey = key;
+         }
+      }
+      else
+         for (i = 0; i < c->h; i++)
+            memcpy(c->px + (size_t)i * c->stride, ctl_bgbuf + (size_t)i * c->w, (size_t)c->w * 4);
    }
-   for (i = 0; i < (int)(sizeof(game) / sizeof(*game)); i++)
    {
-      gfx_draw_text(c, f_small, game[i][0], 460, y0 + 26 + i * rh, C_TEXT, 140);
-      gfx_draw_text(c, f_small, game[i][1], 610, y0 + 26 + i * rh, C_DIM, 230);
+      /* a faint box round each column: a slightly darker inside and a thin line in the accent colour, barely there */
+      static const int bx[2] = { 8, 438 }, bw[2] = { 426, 408 };
+      uint32_t edge = blend256(0xff190f1d, C_ACCENT, 70);
+      int k;
+      for (k = 0; k < 2; k++)
+      {
+         fill_round_rect_alpha(c, bx[k], 51, bw[k], 381, 12, 0xff000000, 60);
+         stroke_round_rect(c, bx[k], 51, bw[k], 381, 12, edge);
+      }
    }
-   draw_centered(c, f_small, "Press any button to close", c->w / 2, c->h - 34, C_FAINT);
+   draw_title_pill(c, "Controls", c->w / 2, 6);
+   gfx_draw_text(c, f_small, "IN THE MENU", cx0[0], 54, C_ACCENT, 0);
+   gfx_draw_text(c, f_small, "IN A GAME", cx0[1], 54, C_ACCENT, 0);
+   {
+      int nw = font_text_width(f_small, name), mw = nw > 200 ? 200 : nw, ty = 90 - font_height(f_small) / 2;
+      const char *note = !own[1] && sc >= 0 ? "same as All consoles" : "";
+      glyph_one(c, "L", cx0[1], 90, 1);
+      gfx_draw_text(c, f_small, name, cx0[1] + 32, ty, C_TEXT, 200);
+      glyph_one(c, "R", cx0[1] + 32 + mw + 8, 90, 1);
+      snprintf(num, sizeof(num), "%d / %d", rm.pi + 1, rm.npage);
+      gfx_draw_text(c, f_small, num, c->w - 20 - font_text_width(f_small, num), ty, C_FAINT, 0);
+      gfx_draw_text(c, f_small, note, c->w - 20 - font_text_width(f_small, note), 54, C_FAINT, 0);
+   }
+   for (col = 0; col < 2; col++)
+   {
+      int sel_row = rm.row[col];
+      for (i = rm.top[col]; i < rm.n[col] && i < rm.top[col] + CTL_VIS; i++)
+      {
+         const ctl_item_t *e = &rm.it[col][i];
+         int y = y0 + (i - rm.top[col]) * rh + rh / 2, fh = font_height(f_small), x = cx0[col];
+         if (e->kind != 3 && i == sel_row && col == rm.col)
+            fill_round_rect(c, x - 10, y - rh / 2, col ? c->w - x - 8 : 410, rh, 8, C_SEL);
+         if (e->kind == 3)
+         {
+            int lw = font_text_width(f_small, e->label);
+            gfx_draw_text(c, f_small, e->key, x, y - fh / 2, C_DIM, col ? 110 : 150);
+            gfx_draw_text(c, f_small, e->label, rt[col] - (lw > 250 ? 250 : lw), y - fh / 2, C_FAINT, 250);
+            continue;
+         }
+         if (e->kind == 4)
+            gfx_draw_text(c, f_small, remap_dev() ? "DualShock" : "Standard", x, y - fh / 2, remap_dev() ? C_ACCENT : C_TEXT, 120);
+         else if (i == sel_row && col == rm.col && rm.capture)
+         {
+            /* in place of the whole row, so nothing runs into its name */
+            char msg[64];
+            int left = (int)ceil(rm.capture_until - now_s());
+            snprintf(msg, sizeof(msg), "Press a button  (%d)", left < 0 ? 0 : left);
+            gfx_draw_text(c, f_small, msg, x, y - fh / 2, C_ACCENT, 0);
+         }
+         else if (e->kind == 2)
+         {
+            int w = glyph_one(c, pb_glyph[hk[col][0]], x, y, 1);
+            if (e->id > 0)
+            {
+               gfx_draw_text(c, f_small, "+", x + w + 6, y - fh / 2, C_DIM, 0);
+               glyph_one(c, pb_glyph[hk[col][e->id]], x + w + 22, y, 1);
+            }
+         }
+         else
+            glyph_one(c, pb_glyph[pad[col][e->id]], x, y, 1);
+         {
+            /* the name of what the button does sits against the right edge, so it stays in view while the button is being chosen */
+            int lw = font_text_width(f_small, e->label);
+            gfx_draw_text(c, f_small, e->label, rt[col] - (lw > 300 ? 300 : lw), y - fh / 2,
+                  col == rm.col && i == sel_row ? C_TEXT : C_DIM, 300);
+         }
+      }
+      if (rm.n[col] > CTL_VIS)
+      {
+         int bar = (CTL_VIS * CTL_VIS * rh) / rm.n[col], by = y0 + rm.top[col] * (CTL_VIS * rh - bar) / (rm.n[col] - CTL_VIS);
+         gfx_fill_rect(c, col ? c->w - 8 : 434, by, 3, bar, C_FAINT);
+      }
+   }
+   {
+      char wait_hint[32];
+      int left = (int)ceil(rm.capture_until - now_s());
+      snprintf(wait_hint, sizeof(wait_hint), "%ds  Cancel", left < 0 ? 0 : left);
+      draw_hints(c, rm.capture ? wait_hint
+         : "A  Change     Dpad  Navigation     L / R  Console     Start / Menu  Reset     B  Back");
+   }
+   glyph_raw = 0;
 }
 
 /* Home screen: every item is a card. The focused card is full size; cards shrink the
@@ -3179,8 +4739,10 @@ static void draw_controls(canvas_t *c)
 #define CARD_W    460
 #define CARD_H    210
 #define CARD_GAP  410     /* card centres along a row, at full size */
+#define SIDE_PUSH 20      /* the cards beside the focused one sit this much further out, so more of the background shows */
 #define ROW_GAP   235     /* row centres */
 #define HOME_CY   222     /* centre of the focused row */
+#define GS        224     /* a game card in the games carousel: square, a touch taller than the home screen's cards */
 
 typedef struct
 {
@@ -3188,6 +4750,12 @@ typedef struct
    double scale, depth;
    double rowd;      /* the card's row offset: <0 above the focused row, >0 below */
 } card_t;
+
+static int side_push(double off)
+{
+   double a = fabs(off) < 1 ? fabs(off) : 1;
+   return (int)(a * SIDE_PUSH + 0.5) * (off < 0 ? -1 : 1);
+}
 
 static double card_scale_x(double dx)
 {
@@ -3465,6 +5033,74 @@ static void draw_glow(canvas_t *cv, const image_t *fit, int ox, int oy)
 /* Like the Set 2 logos, from the back: a purple-blue 3D edge (down and right), a white
  * outline (the letters thickened), then the letters in the gradient. top is where the
  * outline starts. */
+/* A shadow cast onto a card, made when the card is built (so free while scrolling): a mask (0..255, mw x mh, its top left at
+ * x, y on the canvas) moved by dx, dy (down and right: the light is at the top left, as in card_depth), softened by two
+ * box blurs of radius blur, and mixed over the card in col at opacity 0..255. */
+static void box_blur_u8(unsigned char *m, int w, int h, int rad)
+{
+   unsigned char *tmp = malloc((size_t)w * h);
+   int x, y, pass;
+   if (!tmp || rad < 1)
+   {
+      free(tmp);
+      return;
+   }
+   for (pass = 0; pass < 2; pass++)
+   {
+      for (y = 0; y < h; y++)   /* horizontal */
+      {
+         int sum = 0, n = 2 * rad + 1;
+         for (x = -rad; x <= rad; x++)
+            sum += x >= 0 && x < w ? m[y * w + x] : 0;
+         for (x = 0; x < w; x++)
+         {
+            tmp[y * w + x] = (unsigned char)(sum / n);
+            sum += (x + rad + 1 < w ? m[y * w + x + rad + 1] : 0) - (x - rad >= 0 ? m[y * w + x - rad] : 0);
+         }
+      }
+      for (x = 0; x < w; x++)   /* vertical */
+      {
+         int sum = 0, n = 2 * rad + 1;
+         for (y = -rad; y <= rad; y++)
+            sum += y >= 0 && y < h ? tmp[y * w + x] : 0;
+         for (y = 0; y < h; y++)
+         {
+            m[y * w + x] = (unsigned char)(sum / n);
+            sum += (y + rad + 1 < h ? tmp[(y + rad + 1) * w + x] : 0) - (y - rad >= 0 ? tmp[(y - rad) * w + x] : 0);
+         }
+      }
+   }
+   free(tmp);
+}
+
+static void cast_mask_shadow(canvas_t *cv, const unsigned char *mask, int mw, int mh, int x, int y, int dx, int dy, int blur,
+                             uint32_t col, int opacity)
+{
+   int pad = blur * 2 + 2, bw = mw + 2 * pad, bh = mh + 2 * pad, i, j;
+   unsigned char *m = calloc((size_t)bw * bh, 1);
+   if (!m)
+      return;
+   for (j = 0; j < mh; j++)
+      memcpy(m + (size_t)(j + pad) * bw + pad, mask + (size_t)j * mw, (size_t)mw);
+   box_blur_u8(m, bw, bh, blur);
+   for (j = 0; j < bh; j++)
+   {
+      int cy = y - pad + dy + j;
+      if (cy < 0 || cy >= cv->h)
+         continue;
+      for (i = 0; i < bw; i++)
+      {
+         int cx = x - pad + dx + i;
+         unsigned a = (unsigned)m[j * bw + i] * opacity / 255;
+         if (a > 0 && cx >= 0 && cx < cv->w)
+            cv->px[(size_t)cy * cv->stride + cx] = mix(cv->px[(size_t)cy * cv->stride + cx], col, a);
+      }
+   }
+   free(m);
+}
+
+static uint32_t letter_shadow_col;   /* not 0: draw_gradient_mask casts a shadow of the letters in this colour (the cards' words) */
+
 static void draw_gradient_mask(canvas_t *cv, const image_t *fit, int cx, int top, int two)
 {
    int p = gradient_outline(fit), edge = gradient_edge(fit);
@@ -3494,6 +5130,8 @@ static void draw_gradient_mask(canvas_t *cv, const image_t *fit, int cx, int top
                      *g = (unsigned char)a;
                }
          }
+      if (letter_shadow_col)
+         cast_mask_shadow(cv, grow, dw, dh, ox - p, oy - p, edge + 3, edge + 7, 4, letter_shadow_col, 190);
       for (y = 0; y < dh; y++)
          for (x = 0; x < dw; x++)
          {
@@ -3538,12 +5176,28 @@ static uint32_t mix_colour(uint32_t a, uint32_t b, int t256)
 }
 
 /* like fill_round_rect, but see-through: alpha 0..255 (for the soft shadow) */
+/* a rounded rectangle shaded left to right (one column at a time, like the smooth vertical one) */
+static void fill_round_rect_hgrad(canvas_t *c, int x, int y, int w, int h, int r, uint32_t left_col, uint32_t right_col)
+{
+   canvas_t sub = *c;
+   int i;
+   for (i = 0; i < w; i++)
+   {
+      if (x + i < 0 || x + i >= c->w)
+         continue;
+      sub.px = c->px + x + i;
+      sub.w = 1;
+      fill_round_rect(&sub, -i, y, w, h, r, mix_colour(left_col, right_col, w > 1 ? 256 * i / (w - 1) : 0));
+   }
+}
+
 static void fill_round_rect_alpha(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col, int alpha)
 {
    int x, y;
    for (y = y0 < 0 ? 0 : y0; y < y0 + h && y < c->h; y++)
    {
       float py = y + 0.5f, dy = 0;
+      int mid0 = x0 + r, mid1 = x0 + w - r - 1;   /* the straight middle: no horizontal distance */
       if (py < y0 + r)
          dy = y0 + r - py;
       else if (py > y0 + h - r)
@@ -3551,6 +5205,22 @@ static void fill_round_rect_alpha(canvas_t *c, int x0, int y0, int w, int h, int
       for (x = x0 < 0 ? 0 : x0; x < x0 + w && x < c->w; x++)
       {
          float px = x + 0.5f, dx = 0, cov;
+         if (x >= mid0 && x <= mid1)
+         {
+            /* the middle of the row is one strength all along: worked out once, then only blended */
+            int end = mid1 < c->w - 1 ? mid1 : c->w - 1, xx;
+            cov = r + 0.5f - dy;
+            if (cov > 0)
+            {
+               int a = (int)((cov > 1 ? 1.0f : cov) * alpha / 255.0f * 256);
+               uint32_t *d = &c->px[(size_t)y * c->stride], rb = (col & 0xff00ff) * a, g = (col & 0x00ff00) * a;
+               for (xx = x; xx <= end; xx++)
+                  d[xx] = 0xff000000 | (((d[xx] & 0xff00ff) * (256 - a) + rb) >> 8 & 0xff00ff) |
+                          (((d[xx] & 0x00ff00) * (256 - a) + g) >> 8 & 0x00ff00);
+            }
+            x = end;
+            continue;
+         }
          if (px < x0 + r)
             dx = x0 + r - px;
          else if (px > x0 + w - r)
@@ -3644,18 +5314,353 @@ static image_t *card_logo(int r, int i)
    return access(path, F_OK) == 0 ? image_load(path) : NULL;
 }
 
-static cardimg_t *card_image(int r, int i)
+/* Cards with a logo are drawn in a middle tone of the theme's colour instead of the dark card: most logos are dark or
+ * mid-coloured (navy, red) and sank into the dark card, but some are white (Game Gear, PlayStation ...) and would sink
+ * into a light one. A relative luminance of about 0.24 is where the darkest logo and white have about the same contrast
+ * (3 to 4 : 1). tone_card() mixes the theme's colour towards white until it gets there. */
+static float lum_lin(int v)
+{
+   float c = v / 255.0f;
+   return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+static float rel_lum(uint32_t c)
+{
+   return 0.2126f * lum_lin((c >> 16) & 0xff) + 0.7152f * lum_lin((c >> 8) & 0xff) + 0.0722f * lum_lin(c & 0xff);
+}
+
+static uint32_t tone_card(uint32_t base, float target)
+{
+   int lo = 0, hi = 256, t;
+   while (hi - lo > 1)
+   {
+      t = (lo + hi) / 2;
+      if (rel_lum(mix_colour(base, 0xffffffff, t)) < target)
+         lo = t;
+      else
+         hi = t;
+   }
+   return mix_colour(base, 0xffffffff, lo);
+}
+
+/* Depth for a card image (made once, cached with the card, so it costs nothing while scrolling). The card is lit as
+ * a pillow: its height rises from the edge over PILLOW_W pixels (a quarter-sine profile) to a flat top, so the
+ * surface tilts most at the edge and not at all in the middle. A light from the top left (like Photoshop's angle and
+ * altitude) gives each pixel a diffuse value from its tilt, and a "gloss contour" (a wavy curve, as in Photoshop's bevel
+ * styles) turns that smooth ramp into rings of light and dark that follow the card's outline. The result is one table
+ * for the whole card size, worked out once, and applied to each card as a mix towards white (+) or dark (-).
+ * strength 0..256 scales it (the dark cards get less than the mid-tone ones, where it shows more). */
+#define PILLOW_SLOPE  1.6f    /* the surface's tilt at the edge (it falls off with the square of the way in, so the middle is gently domed) */
+#define PILLOW_LIGHT  115     /* the brightest part's mix towards white, of 256 */
+#define PILLOW_SHADE  195     /* the darkest part's mix towards dark, of 256 */
+static short *pillow_map;     /* CARD_W x CARD_H, made on first use */
+
+/* The height is a dome: it rises from the card's outline all the way to the middle (no flat top, which looked pressed
+ * against the screen). With q = the position from the centre as a share of the card's half size, the tilt of the surface
+ * is (sign(x) * qx^2, sign(y) * qy^2) * PILLOW_SLOPE: steepest at the edge, gentle but never zero across the face, and a
+ * smooth polynomial everywhere (no normalising, no creases or rings from a changing direction). A light from the top left
+ * gives each pixel a diffuse value from the tilt, and that is the whole shading: one smooth gradient with no rings drawn
+ * in, the rings are just the lines of equal light. */
+static short *pillow_build(int W, int H)
+{
+   const float a = W / 2.0f, b = H / 2.0f;
+   float lx = -0.30f, ly = -0.55f, lz = 0.78f, ln = sqrtf(lx * lx + ly * ly + lz * lz), d0;
+   int x, y;
+   short *map = malloc((size_t)W * H * sizeof(short));
+   if (!map)
+      return NULL;
+   lx /= ln;
+   ly /= ln;
+   lz /= ln;
+   d0 = lz;   /* a level surface's value */
+   for (y = 0; y < H; y++)
+      for (x = 0; x < W; x++)
+      {
+         float qx = (x + 0.5f - a) / a, qy = (y + 0.5f - b) / b;
+         float nx = (qx < 0 ? -1.0f : 1.0f) * qx * qx * PILLOW_SLOPE, ny = (qy < 0 ? -1.0f : 1.0f) * qy * qy * PILLOW_SLOPE;
+         float nn = sqrtf(nx * nx + ny * ny + 1.0f), dif = (nx * lx + ny * ly + lz) / nn, t, v;
+         dif = dif < 0 ? 0 : dif;
+         /* -1 (darkest) .. 0 (a level surface) .. +1 (brightest) */
+         t = dif >= d0 ? (dif - d0) / (1.0f - d0) : (dif - d0) / d0;
+         v = t > 1 ? 1 : t < -1 ? -1 : t;
+         map[y * W + x] = (short)(v >= 0 ? v * PILLOW_LIGHT : v * PILLOW_SHADE);
+      }
+   return map;
+}
+
+static void pillow_make(void)
+{
+   pillow_map = pillow_build(CARD_W, CARD_H);
+}
+
+/* the same shading on a game card (square) */
+static short *pillow_sq;
+
+static void card_depth_sq(canvas_t *cv, uint32_t body_bot, int strength)
+{
+   int x, y;
+   uint32_t dark = mix_colour(body_bot, 0xff000000, 170);
+   if (!pillow_sq)
+      pillow_sq = pillow_build(GS, GS);
+   if (!pillow_sq || cv->w != GS || cv->h != GS)
+      return;
+   for (y = 0; y < cv->h; y++)
+   {
+      uint32_t *row = cv->px + (size_t)y * cv->stride;
+      const short *m = pillow_sq + (size_t)y * GS;
+      for (x = 0; x < cv->w; x++)
+      {
+         int a = m[x] * strength / 256;
+         if (a > 0)
+            row[x] = mix_colour(row[x], 0xffffffff, a);
+         else if (a < 0)
+            row[x] = mix_colour(row[x], dark, -a);
+      }
+   }
+}
+
+static void card_depth(canvas_t *cv, uint32_t body_top, uint32_t body_bot, int strength)
+{
+   int x, y;
+   uint32_t dark = mix_colour(body_bot, 0xff000000, 170);
+   if (!pillow_map)
+      pillow_make();
+   if (!pillow_map || cv->w != CARD_W || cv->h != CARD_H)
+      return;
+   (void)body_top;
+   for (y = 0; y < cv->h; y++)
+   {
+      uint32_t *row = cv->px + (size_t)y * cv->stride;
+      const short *m = pillow_map + (size_t)y * CARD_W;
+      for (x = 0; x < cv->w; x++)
+      {
+         int a = m[x] * strength / 256;
+         if (a > 0)
+            row[x] = mix_colour(row[x], 0xffffffff, a);
+         else if (a < 0)
+            row[x] = mix_colour(row[x], dark, -a);
+      }
+   }
+}
+
+/* A logo's shadow on the card: its alpha, shrunk to the size it's drawn at, as the shadow's shape (see cast_mask_shadow). */
+static void cast_logo_shadow(canvas_t *cv, const image_t *logo, int x, int y, int w, int h, int dx, int dy, int blur,
+                             uint32_t col, int opacity)
+{
+   unsigned char *m = malloc((size_t)w * h);
+   int i, j;
+   if (!m)
+      return;
+   for (j = 0; j < h; j++)
+      for (i = 0; i < w; i++)
+         m[(size_t)j * w + i] = (unsigned char)(logo->px[(size_t)(j * logo->h / h) * logo->w + i * logo->w / w] >> 24);
+   cast_mask_shadow(cv, m, w, h, x, y, dx, dy, blur, col, opacity);
+   free(m);
+}
+
+/* ------------------------------------------------------------- borders around games
+ * A game that isn't 16:9 leaves bars at the sides of the screen. Just before a game starts the menu paints a backdrop for
+ * the whole screen into /tmp/g36-bezel.raw: the menu's own background in the current theme, a glow in the accent colour
+ * along where the game's edges will be, and the console's logo on a plaque in each bar wide enough. Our RetroArch's video
+ * driver (oga_gfx.c) shows the parts of it that lie outside the game picture. The game's shape is guessed from the
+ * console (the emulator decides the real one, see retroarch_r): a game that differs a little just covers a bit more of the
+ * backdrop, or shows a bit more. Settings -> Borders around games turns it off. File: "G36B", width, height, 4 spare bytes,
+ * then width*height 0xAARRGGBB pixels. */
+#define BEZEL_FILE "/tmp/g36-bezel.raw"
+
+/* a copy of an image turned a quarter, anticlockwise (so text on it reads upwards) */
+static image_t *image_rot_ccw(const image_t *in)
+{
+   image_t *o = malloc(sizeof(*o));
+   int x, y;
+   if (!o)
+      return NULL;
+   o->w  = in->h;
+   o->h  = in->w;
+   o->px = malloc((size_t)o->w * o->h * 4);
+   if (!o->px)
+   {
+      free(o);
+      return NULL;
+   }
+   for (y = 0; y < in->h; y++)
+      for (x = 0; x < in->w; x++)
+         o->px[(size_t)(in->w - 1 - x) * o->w + y] = in->px[(size_t)y * in->w + x];
+   return o;
+}
+
+static double bezel_aspect(const char *id)
+{
+   if (!strcmp(id, "gba"))
+      return 1.5;
+   if (!strcmp(id, "gb") || !strcmp(id, "gbc") || !strcmp(id, "gamegear"))
+      return 160.0 / 144.0;
+   if (!strcmp(id, "ngp") || !strcmp(id, "ngpc"))
+      return 20.0 / 19.0;
+   if (!strcmp(id, "atarilynx"))
+      return 1.6;
+   return 4.0 / 3.0;
+}
+
+/* the system a game belongs to: roms/<id>/... */
+static void bezel_write_rom(const char *rom)
+{
+   char id[64] = "", tmp[64];
+   canvas_t *scr = gfx_canvas(), cv;
+   const char *p = strncmp(rom, ROMS "/", sizeof(ROMS)) ? NULL : rom + sizeof(ROMS);
+   int W, H, ew, gx0, gx1, bar, x, y, d, side;
+   uint32_t *px, accent;
+   double t0 = now_s();
+   FILE *f;
+
+   if (p)
+   {
+      size_t n = strcspn(p, "/");
+      if (n && n < sizeof(id))
+      {
+         memcpy(id, p, n);
+         id[n] = 0;
+      }
+   }
+   if (!scr || !id[0] || !setting_int("game_borders", 1))
+   {
+      unlink(BEZEL_FILE);
+      return;
+   }
+   W = scr->w;
+   H = scr->h;
+   ew = (int)(H * bezel_aspect(id) + 0.5);
+   if (ew > W - 16)
+   {
+      unlink(BEZEL_FILE);   /* no bars to fill */
+      return;
+   }
+   gx0 = (W - ew) / 2;
+   gx1 = gx0 + ew;
+   bar = gx0;
+   if (!bg)
+      bg = bg_build(scr, 0);
+   if (!bg)
+      return;
+   px = malloc((size_t)W * H * 4);
+   if (!px)
+      return;
+   cv.w = cv.stride = W;
+   cv.h = H;
+   cv.px = px;
+   for (y = 0; y < H; y++)
+      memcpy(px + (size_t)y * W, bg + (size_t)(y + BG_M) * (W + 2 * BG_M) + BG_M, (size_t)W * 4);
+
+   /* the light of the game spilling into the bars: the theme's light colour mixed in, strongest at the game's edge and
+    * fading across the bar, plus a thin bright line in the accent colour at the edge itself */
+   accent = TH(TH_ACCENT);
+   {
+      uint32_t spill = mix_colour(TH(TH_BG_LIGHT), accent, 90);
+      for (side = 0; side < 2; side++)
+         for (d = 0; d < bar; d++)
+         {
+            float k = 1.0f - (float)d / bar;
+            int a = 40 + (int)(150.0f * k * k);
+            if (d < 2)
+               a = 215 - d * 45;
+            x = side ? gx1 + d : gx0 - 1 - d;
+            for (y = 0; y < H; y++)
+            {
+               /* a little less at the very top and bottom, so the bars feel lit from the middle */
+               float v = 1.0f - 0.45f * fabsf((float)y / H - 0.5f) * 2.0f;
+               int ay = d < 2 ? a : (int)(a * v);
+               px[(size_t)y * W + x] = mix_colour(px[(size_t)y * W + x], d < 2 ? accent : spill, ay);
+            }
+         }
+   }
+
+   /* the console's logo on one plaque in the left bar, turned to read upwards so it fits even a narrow bar */
+   if (bar >= 44)
+   {
+      char path[300];
+      image_t *logo;
+      snprintf(path, sizeof(path), "%s/%s.png", LOGO_DIR, id);
+      if (access(path, F_OK) == 0 && (logo = image_load(path)))
+      {
+         int t = bar - 18 > 124 ? 124 : bar - 18;               /* the plaque's thickness: across the bar */
+         int lh = t - 16, lw = logo->w * lh / logo->h, len, x0, y0;
+         image_t *rl;
+         if (lw > H - 120)
+         {
+            lw = H - 120;
+            lh = logo->h * lw / logo->w;
+         }
+         len = lw + 30;                                          /* its length: up the bar */
+         x0  = (bar - t) / 2;
+         y0  = (H - len) / 2;
+         if ((rl = image_rot_ccw(logo)))
+         {
+            int lx = x0 + (t - lh) / 2, ly = y0 + (len - lw) / 2;
+            /* the light is the game window, to the right: the shadows fall to the left, and the plaque is brighter on its
+             * right side with a thin bright rim there */
+            int yy;
+            fill_round_rect_alpha(&cv, x0 - 8, y0 + 1, t, len, 12, 0xff000000, 55);
+            fill_round_rect_alpha(&cv, x0 - 4, y0 + 1, t, len, 12, 0xff000000, 90);
+            fill_round_rect_hgrad(&cv, x0, y0, t, len, 12, TH(TH_CARDL_BOT), TH(TH_CARDL_TOP));
+            for (yy = y0 + 12; yy < y0 + len - 12; yy++)
+               fill_px(&cv, x0 + t - 2, yy, 0xffffffff, 0.30f);
+            cast_logo_shadow(&cv, rl, lx, ly, lh, lw, -4, 1, 2, mix_colour(TH(TH_CARDL_BOT), 0xff000000, 200), 190);
+            gfx_draw_image_scaled(&cv, rl, lx, ly, lh, lw);
+            image_free(rl);
+         }
+         image_free(logo);
+      }
+   }
+
+   for (y = 0; y < W * H; y++)
+      px[y] |= 0xff000000;
+   snprintf(tmp, sizeof(tmp), "%s.tmp", BEZEL_FILE);
+   if ((f = fopen(tmp, "wb")))
+   {
+      uint32_t head[4] = { 0x42363347u /* "G36B" */, (uint32_t)W, (uint32_t)H, 0 };
+      int ok = fwrite(head, sizeof(head), 1, f) == 1 && fwrite(px, (size_t)W * H * 4, 1, f) == 1;
+      ok = fclose(f) == 0 && ok;
+      if (ok)
+         rename(tmp, BEZEL_FILE);
+      else
+         unlink(tmp);
+   }
+   free(px);
+   mlog("borders: %s, game %d px wide, bars %d px: %.0f ms", id, ew, bar, (now_s() - t0) * 1000);
+}
+
+/* The same shadow for text drawn on a card: a dark copy a little down and right, then the text itself on top */
+static void draw_centered_shadow(canvas_t *cv, font_t *f, const char *t, int cx, int y, uint32_t col, uint32_t shadow)
+{
+   draw_centered(cv, f, t, cx + 2, y + 3, shadow);
+   draw_centered(cv, f, t, cx + 1, y + 2, shadow);
+   draw_centered(cv, f, t, cx, y, col);
+}
+
+/* a theme change makes every card on screen draw again (20-30 ms each on the handheld): rather than all in one frame, as
+ * many as fit in CARD_BUDGET seconds a frame, the rest showing their old picture meanwhile */
+#define CARD_BUDGET 0.02
+static double card_spent;      /* time spent drawing cards this frame */
+static int card_pending;       /* a card was left with its old picture */
+static int preview_defer;      /* the theme just changed: the editor's preview shows its wheel one frame before the work */
+
+static cardimg_t *card_image_(int r, int i)
 {
    cardimg_t *ci = &card_cache[r][i < MAX_SYSTEMS ? i : 0];
    char name[96], sub[48], key[160];
    canvas_t cv;
    image_t *logo;
-   int nh, sh, ty, tw;
+   int nh, sh, ty, tw, mid;
 
    row_item(r, i, name, sizeof(name), sub, sizeof(sub));
    snprintf(key, sizeof(key), "%s|%s", name, sub);
    if (ci->img.px && !strcmp(ci->key, key))
       return ci;
+   if (ci->img.px && !ci->key[0] && card_spent > CARD_BUDGET)
+   {
+      card_pending = 1;   /* a theme change left this one to redo: the old picture stays up until there's time in a frame */
+      return ci;
+   }
    if (!ci->img.px)
    {
       ci->img.w = CARD_W;
@@ -3668,7 +5673,19 @@ static cardimg_t *card_image(int r, int i)
    cv.w = cv.stride = CARD_W;
    cv.h = CARD_H;
    cv.px = ci->img.px;
-   fill_vgradient(&cv, 0, 0, CARD_W, CARD_H, TH(TH_CARD_TOP), TH(TH_CARD_BOT));
+   {
+      /* the Consoles row's logo cards and the Collections cards are the theme's light card colours (derived from the card colour and accent, see derive_light_cards);
+       * the rest (Tools, the players) keep the dark card */
+      mid = r == ROW_COLL || (r != ROW_MEDIA && r != ROW_TOOLS && !(r == ROW_CONS && !nvisible));
+      uint32_t top = TH(TH_CARD_TOP), bot = TH(TH_CARD_BOT);
+      if (mid)
+      {
+         top = TH(TH_CARDL_TOP);
+         bot = TH(TH_CARDL_BOT);
+      }
+      fill_vgradient(&cv, 0, 0, CARD_W, CARD_H, top, bot);
+      card_depth(&cv, top, bot, mid ? 256 : 110);
+   }
    /* no subtitle (Settings): the name sits in the middle */
    sh = sub[0] ? font_height(f_mid) + 14 : 0;
    if ((logo = card_logo(r, i)))
@@ -3681,8 +5698,9 @@ static cardimg_t *card_image(int r, int i)
          lh = 120;
       }
       ly = (CARD_H - lh - sh) / 2;
+      cast_logo_shadow(&cv, logo, CARD_W / 2 - lw / 2, ly, lw, lh, 5, 8, 4, mix_colour(TH(TH_CARD_BOT), 0xff000000, 200), 190);
       gfx_draw_image_scaled(&cv, logo, CARD_W / 2 - lw / 2, ly, lw, lh);
-      draw_centered(&cv, f_mid, sub, CARD_W / 2, ly + lh + 14, C_DIM);
+      draw_centered_shadow(&cv, f_mid, sub, CARD_W / 2, ly + lh + 14, 0xffffffff, mix_colour(TH(TH_CARD_BOT), 0xff000000, 130));
       image_free(logo);
    }
    else if ((r != ROW_CONS || !nvisible) && access(LOGO_FONT, F_OK) == 0)
@@ -3699,11 +5717,14 @@ static cardimg_t *card_image(int r, int i)
       if (mask)
       {
          glow_on = warn;
+         letter_shadow_col = warn ? 0 : mix_colour(TH(TH_CARD_BOT), 0xff000000, 200);
          draw_gradient_mask(&cv, mask, CARD_W / 2, ty, two_lines);
+         letter_shadow_col = 0;
          glow_on = 0;
          image_free(mask);
       }
-      draw_centered(&cv, f_mid, sub, CARD_W / 2, ty + lh + 14, C_DIM);
+      draw_centered_shadow(&cv, f_mid, sub, CARD_W / 2, ty + lh + 14, mid ? 0xffffffff : C_DIM,
+                           mix_colour(TH(TH_CARD_BOT), 0xff000000, 130));
    }
    else
    {
@@ -3722,6 +5743,14 @@ static cardimg_t *card_image(int r, int i)
       image_free(ci->scaled);
    ci->half = image_half(&ci->img);
    ci->scaled = NULL;
+   return ci;
+}
+
+static cardimg_t *card_image(int r, int i)
+{
+   double t0 = now_s();
+   cardimg_t *ci = card_image_(r, i);
+   card_spent += now_s() - t0;
    return ci;
 }
 
@@ -3759,29 +5788,52 @@ static int card_prewarm(void)
 static int smooth_budget;   /* smooth copies allowed this frame, so a stop doesn't hitch */
 
 /* round off a card's corners by putting the background back outside radius r */
+/* d with the source at `a` of 256 (0..256) over it, both opaque: the red and blue together, the green on its own */
+static inline uint32_t blend256(uint32_t d, uint32_t s, unsigned a)
+{
+   return 0xff000000 | (((s & 0xff00ff) * a + (d & 0xff00ff) * (256 - a)) >> 8 & 0xff00ff) |
+          (((s & 0x00ff00) * a + (d & 0x00ff00) * (256 - a)) >> 8 & 0x00ff00);
+}
+
 static void round_corners(canvas_t *c, int x, int y, int w, int h, int r)
 {
    int i, j, corner;
-   if (!bg || r < 2)
+   double r1 = r - 1.0;
+   if (!bg_cur || r < 2)
       return;
    for (corner = 0; corner < 4; corner++)
    {
       int cx = corner & 1 ? x + w - r : x + r, cy = corner & 2 ? y + h - r : y + r;
       int x0 = corner & 1 ? x + w - r : x, y0 = corner & 2 ? y + h - r : y;
       for (j = y0; j < y0 + r; j++)
-         for (i = x0; i < x0 + r; i++)
+      {
+         double dy = j + 0.5 - cy;
+         int i0 = x0, i1 = x0 + r;
+         if (j < 0 || j >= c->h)
+            continue;
+         if (fabs(dy) < r1)
          {
-            double dx = i + 0.5 - cx, dy = j + 0.5 - cy, d;
+            /* the part of the row inside the curve is left alone: only the pixels outside it are visited */
+            double sx = sqrt(r1 * r1 - dy * dy);
+            if (corner & 1)
+               i0 = (int)floor(cx + sx - 0.5) > x0 ? (int)floor(cx + sx - 0.5) : x0;
+            else
+               i1 = (int)ceil(cx - sx - 0.5) + 1 < x0 + r ? (int)ceil(cx - sx - 0.5) + 1 : x0 + r;
+         }
+         for (i = i0; i < i1; i++)
+         {
+            double dx = i + 0.5 - cx, d2 = dx * dx + dy * dy;
             unsigned a;
-            if (i < 0 || j < 0 || i >= c->w || j >= c->h)
-               continue;
-            d = sqrt(dx * dx + dy * dy);
-            if (d <= r - 1)
+            uint32_t bgp, *dst;
+            if (i < 0 || i >= c->w || d2 <= r1 * r1)
                continue;
             /* outside: background; on the edge: a blend, for a smooth curve */
-            a = d >= r ? 255 : (unsigned)((d - (r - 1)) * 255);
-            c->px[(size_t)j * c->stride + i] = mix(c->px[(size_t)j * c->stride + i], bg[(size_t)j * c->w + i] | 0xff000000, a);
+            a = d2 >= (double)r * r ? 255 : (unsigned)((sqrt(d2) - r1) * 255);
+            bgp = bg_cur[(size_t)(j + BG_M + bg_dy) * bg_w + i + BG_M + bg_dx] | 0xff000000;
+            dst = &c->px[(size_t)j * c->stride + i];
+            *dst = a == 255 ? bgp : mix(*dst, bgp, a);
          }
+      }
    }
 }
 
@@ -3796,7 +5848,7 @@ static void stroke_px(canvas_t *c, int x, int y, uint32_t col, float cov)
    *d = out;
 }
 
-static void stroke_round_rect(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col)
+static void stroke_round_rect_scan(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col)
 {
    float cx = x0 + w / 2.0f, cy = y0 + h / 2.0f, hx = w / 2.0f - r, hy = h / 2.0f - r;
    int x, y;
@@ -3838,6 +5890,119 @@ static void stroke_round_rect(canvas_t *c, int x0, int y0, int w, int h, int r, 
          }
          if (cov > 0)
             stroke_px(c, x, y, col, cov);
+      }
+   }
+}
+
+/* the outline's coverage at a pixel, from its distances out of the straight part (see stroke_round_rect) */
+static inline float stroke_cov(float qx, float qy, int r)
+{
+   float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, sd, cov;
+   sd = sqrtf(ox * ox + oy * oy) + (qx > qy ? (qx < 0 ? qx : 0) : (qy < 0 ? qy : 0)) - r;
+   cov = 1 - (fabsf(sd + 1.0f) - 0.6f) / 0.8f;   /* full for about 1.2 px, fading at both sides */
+   return cov > 1 ? 1 : cov;
+}
+
+/* A thin outline just inside the edge. Only the few pixels along it are looked at: on each row, the stretch of the straight top
+ * or bottom edge (all alike), and where the curve of a corner or the side passes (found from the radius, not by trying every
+ * pixel of the corner). */
+static void stroke_round_rect(canvas_t *c, int x0, int y0, int w, int h, int r, uint32_t col)
+{
+   float cx = x0 + w / 2.0f, cy = y0 + h / 2.0f, hx = w / 2.0f - r, hy = h / 2.0f - r;
+   float lo = r - 2.5f, hi = r + 0.5f;   /* the radii between which the coverage is above 0 */
+   int y, x, sn[2] = { 0, 0 }, sx[2][12], k;
+   unsigned sa[2][12];
+   if (r < 6)
+   {
+      stroke_round_rect_scan(c, x0, y0, w, h, r, col);
+      return;
+   }
+   {
+      /* on the straight sides every row is alike (the coverage only depends on how far in from the edge): worked out once */
+      int s, xa, xb;
+      for (s = 0; s < 2; s++)
+      {
+         xa = s == 0 ? (int)floorf(cx - hx - hi - 0.5f) - 1 : (int)floorf(cx + hx + lo - 0.5f) - 1;
+         xb = s == 0 ? (int)ceilf(cx - hx - lo - 0.5f) + 1 : (int)ceilf(cx + hx + hi - 0.5f) + 1;
+         for (x = xa; x <= xb && sn[s] < 12; x++)
+         {
+            float qx = fabsf(x + 0.5f - cx) - hx, cov;
+            if (qx <= 0 || x < x0 || x >= x0 + w)
+               continue;
+            cov = stroke_cov(qx, 0.0f, r);
+            if (cov > 0)
+            {
+               sx[s][sn[s]] = x;
+               sa[s][sn[s]++] = cov >= 1 ? 256 : (unsigned)(cov * 256);
+            }
+         }
+      }
+   }
+   for (y = y0 < 0 ? 0 : y0; y < y0 + h && y < c->h; y++)
+   {
+      float qy = fabsf(y + 0.5f - cy) - hy, qy2 = qy > 0 ? qy * qy : 0, qlo, qhi, covm = 0;
+      int s, xa, xb, ma = 1, mb = 0;
+      if (qy <= 0)
+      {
+         uint32_t *row = c->px + (size_t)y * c->stride;
+         for (s = 0; s < 2; s++)
+            for (k = 0; k < sn[s]; k++)
+               if (sx[s][k] >= 0 && sx[s][k] < c->w)
+                  row[sx[s][k]] = sa[s][k] == 256 ? 0xff000000 | col : blend256(row[sx[s][k]], col, sa[s][k]);
+         continue;
+      }
+      if (qy > 0)
+      {
+         if (hi * hi <= qy2)
+            continue;
+         qlo = lo * lo > qy2 ? sqrtf(lo * lo - qy2) : 0;
+         qhi = sqrtf(hi * hi - qy2);
+         covm = stroke_cov(-1.0f, qy, r);
+         ma = (int)ceilf(cx - hx - 0.5f) - 1;   /* (the straight stretch, with a pixel to spare at each end) */
+         mb = (int)floorf(cx + hx - 0.5f) + 1;
+      }
+      else
+      {
+         qlo = lo;
+         qhi = hi;
+      }
+      /* the two bands: left (s = 0) and right (s = 1) */
+      for (s = 0; s < 2; s++)
+      {
+         if (s == 0)
+         {
+            xa = (int)floorf(cx - hx - qhi - 0.5f) - 1;
+            xb = (int)ceilf(cx - hx - qlo - 0.5f) + 1;
+         }
+         else
+         {
+            xa = (int)floorf(cx + hx + qlo - 0.5f) - 1;
+            xb = (int)ceilf(cx + hx + qhi - 0.5f) + 1;
+         }
+         for (x = xa < 0 ? 0 : xa; x <= xb && x < c->w; x++)
+         {
+            float qx = fabsf(x + 0.5f - cx) - hx, cov;
+            if (qx <= 0 || x < x0 || x >= x0 + w)
+               continue;   /* (the straight stretch has its own pass) */
+            cov = stroke_cov(qx, qy, r);
+            if (cov > 0)
+               stroke_px(c, x, y, col, cov);
+         }
+      }
+      if (covm > 0)
+      {
+         /* the straight stretch: first and last pixel checked one by one, the rest of it all alike (a plain fill when solid) */
+         int xs = ma < 0 ? 0 : ma, xe = mb < c->w - 1 ? mb : c->w - 1, fa, fb;
+         unsigned a256 = covm >= 1 ? 256 : (unsigned)(covm * 256);
+         uint32_t *row = c->px + (size_t)y * c->stride, solid = 0xff000000 | col;
+         for (fa = xs; fa <= xe; fa++)
+            if (fabsf(fa + 0.5f - cx) - hx <= 0 && fa >= x0 && fa < x0 + w)
+               break;
+         for (fb = xe; fb >= xs; fb--)
+            if (fabsf(fb + 0.5f - cx) - hx <= 0 && fb >= x0 && fb < x0 + w)
+               break;
+         for (x = fa; x <= fb; x++)
+            row[x] = a256 == 256 ? solid : blend256(row[x], col, a256);
       }
    }
 }
@@ -3934,11 +6099,249 @@ static void draw_folder_card(canvas_t *c, const card_t *k)
    }
 }
 
+/* A soft shadow under a card (at the card's current size): a few rows below its bottom edge, fading out, a little narrower
+ * than the card so it doesn't show round the corners. Only about 12 rows of the card's width, so it's cheap enough to draw
+ * every frame. */
+#define CARD_SLAB 10   /* the card's thickness at full size, in pixels */
+static void card_shadow(canvas_t *c, int x, int y, int w, int h, int r, int lift)
+{
+   /* the focused card is lifted: its shadow is deeper and reaches further, so it stands out from the ones beside it.
+    * The ends fade out over feather pixels (smoothstep), so there is no hard edge */
+   int rows = lift ? 12 + h / 7 : 4 + h / 14, j, xx, x0 = x + r / 2, x1 = x + w - r / 2, base = y + h - 3;
+   float feather = (lift ? 70.0f : 26.0f) * w / CARD_W, prof[80];
+   int nprof = (int)ceilf(feather) < 80 ? (int)ceilf(feather) : 79;
+   for (j = 0; j <= nprof; j++)
+   {
+      float t = j >= feather ? 1.0f : j / feather;
+      prof[j] = t * t * (3.0f - 2.0f * t);   /* the ends' fade-out, by distance from the end */
+   }
+   for (j = 0; j < rows; j++)
+   {
+      float f = 1.0f - (float)j / rows;
+      int yy = base + j, xs = x0 + j / 3, xe = x1 - j / 3;
+      float cov = f * f * (lift ? 0.62f : 0.42f);
+      uint32_t *row;
+      if (yy < 0 || yy >= c->h)
+         continue;
+      row = c->px + (size_t)yy * c->stride;
+      for (xx = xs < 0 ? 0 : xs; xx < xe && xx < c->w; xx++)
+      {
+         int d = xx - xs < xe - 1 - xx ? xx - xs : xe - 1 - xx;
+         unsigned a = (unsigned)((d >= nprof ? cov : cov * prof[d]) * 256);
+         if (d >= nprof)
+         {
+            /* the stretch between the faded ends: one strength all along */
+            int end = xe - nprof < c->w ? xe - nprof : c->w;
+            for (; xx < end; xx++)
+               row[xx] = 0xff000000 | (((row[xx] & 0xff00ff) * (256 - a) >> 8) & 0xff00ff) | (((row[xx] & 0x00ff00) * (256 - a) >> 8) & 0x00ff00);
+            xx--;
+            continue;
+         }
+         row[xx] = 0xff000000 | (((row[xx] & 0xff00ff) * (256 - a) >> 8) & 0xff00ff) | (((row[xx] & 0x00ff00) * (256 - a) >> 8) & 0x00ff00);
+      }
+   }
+}
+
+/* Is this row's card a mid-tone one (see card_image), and what is its bottom colour */
+static int card_row_is_mid(int r)
+{
+   return r == ROW_COLL || (r != ROW_MEDIA && r != ROW_TOOLS);
+}
+
+static uint32_t card_row_bottom(int r)
+{
+   return card_row_is_mid(r) ? TH(TH_CARDL_BOT) : TH(TH_CARD_BOT);
+}
+
+/* coverage (0..1) of the pixel centre (px, py) by a rounded rectangle */
+static float rr_cov(float px, float py, float x0, float y0, float w, float h, float r)
+{
+   float qx = fabsf(px - (x0 + w / 2)) - (w / 2 - r), qy = fabsf(py - (y0 + h / 2)) - (h / 2 - r);
+   float mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0, m = qx > qy ? qx : qy;
+   float sd = sqrtf(mx * mx + my * my) + (m < 0 ? m : 0) - r, cov = 0.5f - sd;
+   return cov < 0 ? 0 : cov > 1 ? 1 : cov;
+}
+
+/* the slab's corner weights (0..255) for one corner radius and depth, kept for the last few sizes in use */
+typedef struct
+{
+   int r, T;
+   unsigned char *left, *right;
+} slab_maps_t;
+
+static const slab_maps_t *slab_maps(int r, int T)
+{
+   static slab_maps_t cache[16];
+   static int next;
+   int i, off = T / 3, rows = r + T, px, py;
+   slab_maps_t *m;
+   for (i = 0; i < 16; i++)
+      if (cache[i].left && cache[i].r == r && cache[i].T == T)
+         return &cache[i];
+   m = &cache[next++ & 15];
+   free(m->left);
+   free(m->right);
+   m->r = r;
+   m->T = T;
+   m->left = malloc((size_t)r * rows);
+   m->right = malloc((size_t)(r + off) * rows);
+   if (!m->left || !m->right)
+   {
+      free(m->left);
+      free(m->right);
+      m->left = m->right = NULL;
+      return NULL;
+   }
+   /* a virtual card at (0, 0), 4r wide and 2r high (any width past 2r will do), with the slab at (off, T) */
+   for (py = 0; py < rows; py++)
+   {
+      float yv = r + py + 0.5f;
+      for (px = 0; px < r + off; px++)
+      {
+         float cc, cs, wg;
+         if (px < r)
+         {
+            cc = rr_cov(px + 0.5f, yv, 0, 0, 4.0f * r, 2.0f * r, (float)r);
+            cs = rr_cov(px + 0.5f, yv, (float)off, (float)T, 4.0f * r, 2.0f * r, (float)r);
+            wg = cs * (1 - cc);
+            m->left[py * r + px] = (unsigned char)(wg * 255);
+         }
+         cc = rr_cov(3.0f * r + px + 0.5f, yv, 0, 0, 4.0f * r, 2.0f * r, (float)r);
+         cs = rr_cov(3.0f * r + px + 0.5f, yv, (float)off, (float)T, 4.0f * r, 2.0f * r, (float)r);
+         wg = cs * (1 - cc);
+         m->right[py * (r + off) + px] = (unsigned char)(wg * 255);
+      }
+   }
+   return m;
+}
+
+/* The card's thickness: a slab behind and below it, T pixels deep (and a third of that to the right), so the card is a solid
+ * object with an edge and not a sheet. Only the part of the slab the card doesn't cover is painted, after the card, with the
+ * rounded corners worked out per pixel; the long straight parts are filled a row at a time. */
+static void card_slab(canvas_t *c, int x, int y, int w, int h, int r, int T, uint32_t top_col, uint32_t bot_col)
+{
+   int off = T / 3, py, px;
+   const slab_maps_t *mp;
+   if (T < 2)
+      return;
+   mp = slab_maps(r, T);
+   if (!mp)
+      return;
+   for (py = y + h - r; py < y + h + T; py++)
+   {
+      uint32_t col = mix_colour(top_col, bot_col, 256 * (py - (y + h) < 0 ? 0 : py - (y + h)) / T);
+      if (py < 0 || py >= c->h)
+         continue;
+      /* the straight middle: the card's edge and the slab's edge are horizontal lines */
+      {
+         float cc = 0.5f - (py + 0.5f - (y + h)), cs = 0.5f - (py + 0.5f - (y + h + T));
+         float wgt;
+         cc = cc < 0 ? 0 : cc > 1 ? 1 : cc;
+         cs = cs < 0 ? 0 : cs > 1 ? 1 : cs;
+         wgt = cs * (1 - cc);
+         if (wgt > 0)
+         {
+            unsigned a256 = (unsigned)(wgt * 255), end = (unsigned)(x + w - r + off < c->w ? x + w - r + off : c->w);
+            a256 += a256 >> 7;
+            for (px = x + r < 0 ? 0 : x + r; px < (int)end; px++)
+               c->px[(size_t)py * c->stride + px] = blend256(c->px[(size_t)py * c->stride + px], col, a256);
+         }
+      }
+      /* the two corners (the right one runs on to the slab's right edge): their weights come from a table kept for this
+       * radius and depth (worked out once with the square roots, then only blended) */
+      for (px = x; px < x + w + off; px++)
+      {
+         int idx;
+         unsigned wb;
+         if (px >= x + r && px < x + w - r + off)
+         {
+            px = x + w - r + off - 1;
+            continue;
+         }
+         if (px < 0 || px >= c->w)
+            continue;
+         idx = px < x + r ? (py - (y + h - r)) * r + (px - x) : (py - (y + h - r)) * (r + off) + (px - (x + w - r));
+         wb = px < x + r ? mp->left[idx] : mp->right[idx];
+         if (wb)
+            c->px[(size_t)py * c->stride + px] = blend256(c->px[(size_t)py * c->stride + px], col, wb + (wb >> 7));
+      }
+   }
+   /* the right side, between the corners */
+   for (py = y + r; py < y + h - r; py++)
+   {
+      if (py < 0 || py >= c->h)
+         continue;
+      for (px = x + w - 1; px < x + w + off + 1; px++)
+      {
+         float cc = 0.5f - (px + 0.5f - (x + w)), cs = 0.5f - (px + 0.5f - (x + w + off)), wgt;
+         cc = cc < 0 ? 0 : cc > 1 ? 1 : cc;
+         cs = cs < 0 ? 0 : cs > 1 ? 1 : cs;
+         wgt = cs * (1 - cc);
+         if (wgt > 0 && px >= 0 && px < c->w)
+            c->px[(size_t)py * c->stride + px] = mix(c->px[(size_t)py * c->stride + px], top_col, (unsigned)(wgt * 255));
+      }
+   }
+}
+
+/* The focused card's reflection on a glossy floor: its bottom rows, upside down, under it, fading out. Drawn before the cards,
+ * so the row below covers it where they meet. The corners follow the card's rounding. */
+static void card_reflection(canvas_t *c, const cardimg_t *ci, int x, int y, int w, int h, int r, int T)
+{
+   int rows = h / 4, dy, xx, y0 = y + h + T + 4, sw = ci->img.w, sh = ci->img.h;
+   for (dy = 0; dy < rows; dy++)
+   {
+      int yy = y0 + dy, srow = sh - 1 - dy * sh / h, inset = dy < r ? r - (int)sqrtf((float)(r * r - (r - dy) * (r - dy))) : 0;
+      float f = 1.0f - (float)dy / rows;
+      unsigned a = (unsigned)(f * f * 0.34f * 255), a256 = a + (a >> 7);
+      const uint32_t *src;
+      uint32_t *dst;
+      int xa = x + inset, xb = x + w - inset;
+      uint64_t pos, step;
+      if (yy < 0 || yy >= c->h || srow < 0)
+         continue;
+      src = ci->img.px + (size_t)srow * sw;
+      dst = c->px + (size_t)yy * c->stride;
+      /* the source column for each pixel, stepped along rather than divided out for every pixel */
+      step = (((uint64_t)sw << 32) + w - 1) / w;   /* (rounded up, so the whole part is exactly column * sw / w) */
+      xx = xa < 0 ? 0 : xa;
+      pos = (uint64_t)(xx - x) * step;
+      for (; xx < xb && xx < c->w; xx++, pos += step)
+         dst[xx] = blend256(dst[xx], src[pos >> 32] | 0xff000000, a256);
+   }
+}
+
+/* A glint: a soft white diagonal band that sweeps across a card once when it's chosen (from the button press on). p 0..1 is how far along. */
+static void card_glint(canvas_t *c, int x, int y, int w, int h, int r, double p)
+{
+   float e = (float)(p * p * (3 - 2 * p)), half = w * 0.11f, centre0 = x - half * 1.5f + (w + 3 * half) * e;
+   float peak = 0.34f * sinf((float)p * 3.14159f);
+   int j;
+   for (j = 0; j < h; j++)
+   {
+      int yy = y + j, inset = 0, x0, x1, xx;
+      float centre = centre0 + (j - h / 2) * 0.55f;
+      if (yy < 0 || yy >= c->h)
+         continue;
+      if (j < r)
+         inset = r - (int)sqrtf((float)(r * r - (r - j) * (r - j)));
+      else if (j >= h - r)
+         inset = r - (int)sqrtf((float)(r * r - (j - (h - r)) * (j - (h - r))));
+      x0 = (int)(centre - half) < x + inset ? x + inset : (int)(centre - half);
+      x1 = (int)(centre + half) > x + w - inset ? x + w - inset : (int)(centre + half);
+      for (xx = x0; xx < x1; xx++)
+      {
+         float u = (xx - centre) / half, a = 1 - fabsf(u);
+         if (xx >= 0 && xx < c->w && a > 0)
+            c->px[(size_t)yy * c->stride + xx] = mix(c->px[(size_t)yy * c->stride + xx], 0xffffffff, (unsigned)(a * a * peak * 255));
+      }
+   }
+}
+
 static void draw_card(canvas_t *c, const card_t *k, int focus)
 {
    double t0 = PF_T(), t1;
    cardimg_t *ci;
-   int w = (int)(CARD_W * k->scale), h = (int)(CARD_H * k->scale);
+   int w = (int)(CARD_W * k->scale), h = (int)(CARD_H * k->scale), slab_t;
    if (k->r == ROW_MEDIA && !media_has_logo(k->i))
    {
       draw_folder_card(c, k);
@@ -3949,9 +6352,10 @@ static void draw_card(canvas_t *c, const card_t *k, int focus)
    PF_ADD(PF_IMG, t0);
    t0 = PF_T();
 
-   (void)focus;   /* the focused card shows by its size */
    if (!ci)
       return;
+   slab_t = (int)(CARD_SLAB * k->scale + 0.5);
+   card_shadow(c, x, y + slab_t, w, h, (int)(28 * k->scale), focus);
    if (w == CARD_W && h == CARD_H)
       gfx_draw_image_smooth(c, &ci->img, x, y, w, h);              /* full size: a copy */
    else if (ci->scaled && ci->scaled->w == w && ci->scaled->h == h)
@@ -3978,6 +6382,10 @@ static void draw_card(canvas_t *c, const card_t *k, int focus)
    /* a thin outline, a little lighter than the background */
    stroke_round_rect(c, x, y, w, h, (int)(28 * k->scale), TH(TH_CARD_LINE));
    PF_ADD(PF_STROKE, t1);
+   {
+      uint32_t bot = card_row_bottom(k->r);
+      card_slab(c, x, y, w, h, (int)(28 * k->scale), slab_t, mix_colour(bot, 0xff000000, 110), mix_colour(bot, 0xff000000, 200));
+   }
 }
 
 /* a filled rectangle with corners of radius r, smoothed at the edges
@@ -4075,19 +6483,173 @@ static void draw_toast(canvas_t *c, double now)
    }
    tw = font_text_width(f_mid, ui.toast);
    x = c->w / 2 - tw / 2 - 20;
-   gfx_fill_rect(c, x, 372 - popup_lift, tw + 40, 44, C_PANEL);
-   gfx_fill_rect(c, x, 372 - popup_lift, 4, 44, C_ACCENT);
+   fill_round_rect(c, x - 2, 370 - popup_lift, tw + 44, 48, 24, C_ACCENT);   /* a thin accent rim round a rounded pill */
+   fill_round_rect(c, x, 372 - popup_lift, tw + 40, 44, 22, C_PANEL);
    draw_centered(c, f_mid, ui.toast, c->w / 2, 380 - popup_lift, C_TEXT);
 }
 
 /* above a row: its name, underlined; below: where in the row you are, as dots */
-static void draw_row_label(canvas_t *c, const char *title, int cy, int r)
+/* A translucent pill: the position dots barely move (the row title went back to a solid pill), so they are made once as a small picture with its own
+ * see-through (the shadow outside, a dark or coloured edge, the fill at fill_a of full strength with a highlight along the
+ * top) and then only blended over whatever is behind them, which now shows through: the floor, the stars, the cards of
+ * the next row. The picture is made again only when its size or colours change. */
+typedef struct
 {
-   /* The row's name as a big pill in the theme's accent, in large white letters, so it's
-    * plain which row you're on. Above the focused card, over the row that peeks out. */
-   font_t *tf = f_label ? f_label : f_title ? f_title : f_small;
-   int tw = font_text_width(tf, title), cnt = row_count(r), i;
-   int ph = font_height(tf) + 6, pw = tw + 48, px = c->w / 2 - pw / 2, py0 = cy - CARD_H / 2 - ph - 5;   /* (the gap above the card is about 60 px: stays clear of the row above) */
+   image_t img;
+   char key[96];
+} pillspr_t;
+
+#define PILL_PAD 14
+static void pill_sprite(pillspr_t *sp, int w, int h, int edge, uint32_t edge_col, float edge_a, uint32_t fill, float fill_a, float hi_a, float shadow_a)
+{
+   int sw = w + 2 * PILL_PAD, sh = h + 2 * PILL_PAD + 6, x, y, r = h / 2;
+   if (sp->img.w != sw || sp->img.h != sh || !sp->img.px)
+   {
+      free(sp->img.px);
+      sp->img.px = malloc((size_t)sw * sh * 4);
+      sp->img.w = sw;
+      sp->img.h = sh;
+   }
+   if (!sp->img.px)
+      return;
+   for (y = 0; y < sh; y++)
+      for (x = 0; x < sw; x++)
+      {
+         float px = x + 0.5f, py = y + 0.5f;
+         float outer = rr_cov(px, py, (float)(PILL_PAD - edge), (float)(PILL_PAD - edge), (float)(w + 2 * edge), (float)(h + 2 * edge), (float)(r + edge));
+         float inner = rr_cov(px, py, (float)PILL_PAD, (float)PILL_PAD, (float)w, (float)h, (float)r);
+         float sh1 = rr_cov(px, py, (float)(PILL_PAD - 4), (float)(PILL_PAD + 5 - 4), (float)(w + 8), (float)(h + 8), (float)(r + 4)) * shadow_a * 0.8f;
+         float sh2 = rr_cov(px, py, (float)PILL_PAD, (float)(PILL_PAD + 3), (float)w, (float)h, (float)r) * shadow_a;
+         float ca[3] = { 0, 0, 0 }, aa = sh1 + sh2 * (1 - sh1), t, hi;
+         int k;
+         /* the shadow is only outside the pill: nothing dark shows through its see-through body */
+         aa *= 1 - outer;
+         /* the edge */
+         t = edge_a * outer * (1 - inner);
+         if (t > 0)
+         {
+            float ec[3] = { (edge_col >> 16 & 255) / 255.0f, (edge_col >> 8 & 255) / 255.0f, (edge_col & 255) / 255.0f }, na = t + aa * (1 - t);
+            for (k = 0; k < 3; k++)
+               ca[k] = (ec[k] * t + ca[k] * aa * (1 - t)) / na;
+            aa = na;
+         }
+         /* the fill, with a highlight at the top that fades out by the bottom */
+         t = fill_a * inner;
+         hi = hi_a * (1.0f - (float)(y - PILL_PAD) / (h * 0.9f));
+         if (t > 0)
+         {
+            float fc[3] = { (fill >> 16 & 255) / 255.0f, (fill >> 8 & 255) / 255.0f, (fill & 255) / 255.0f }, na = t + aa * (1 - t);
+            hi = hi < 0 ? 0 : hi;
+            for (k = 0; k < 3; k++)
+            {
+               float c0 = fc[k] + (1.0f - fc[k]) * hi;
+               ca[k] = (c0 * t + ca[k] * aa * (1 - t)) / na;
+            }
+            aa = na;
+         }
+         sp->img.px[(size_t)y * sw + x] = ((uint32_t)(aa * 255 + 0.5f) << 24) | ((uint32_t)(ca[0] * 255 + 0.5f) << 16) |
+                                          ((uint32_t)(ca[1] * 255 + 0.5f) << 8) | (uint32_t)(ca[2] * 255 + 0.5f);
+      }
+}
+
+/* A picture with see-through edges made from drawing code: `fn` draws on a canvas of w x h, once on black and once on white; what
+ * shows through is (white - black), and the colour is what's left of the black one. (Drawn live it would have to be blended
+ * over whatever is behind, every frame.) */
+static void sprite_from_draw(image_t *im, int w, int h, void (*fn)(canvas_t *, const void *), const void *arg)
+{
+   int n = w * h, i;
+   uint32_t *bk = malloc((size_t)n * 4), *wh = malloc((size_t)n * 4);
+   canvas_t cb = { w, h, w, bk }, cw = { w, h, w, wh };
+   if (!bk || !wh)
+   {
+      free(bk);
+      free(wh);
+      return;
+   }
+   if (im->w != w || im->h != h || !im->px)
+   {
+      free(im->px);
+      im->px = malloc((size_t)n * 4);
+      im->w = w;
+      im->h = h;
+   }
+   if (im->px)
+   {
+      for (i = 0; i < n; i++)
+      {
+         bk[i] = 0xff000000;
+         wh[i] = 0xffffffff;
+      }
+      fn(&cb, arg);
+      fn(&cw, arg);
+      for (i = 0; i < n; i++)
+      {
+         int q, diff = 0, a;
+         uint32_t out = 0;
+         for (q = 0; q <= 16; q += 8)
+            diff += 255 - (int)((wh[i] >> q & 255) - (bk[i] >> q & 255));
+         a = diff / 3;   /* how much of what's behind is hidden */
+         a = a < 0 ? 0 : a > 255 ? 255 : a;
+         if (a > 0)
+            for (q = 0; q <= 16; q += 8)
+            {
+               int cc = (int)(bk[i] >> q & 255) * 255 / a;
+               out |= (uint32_t)(cc > 255 ? 255 : cc) << q;
+            }
+         im->px[i] = out | (uint32_t)a << 24;
+      }
+   }
+   free(bk);
+   free(wh);
+}
+
+/* Such a picture put on the canvas: pixels with no alpha skipped, solid ones copied, only the soft edges blended */
+static void sprite_blit(canvas_t *c, const image_t *im, int x0, int y0)
+{
+   int x, y;
+   for (y = 0; y < im->h; y++)
+   {
+      const uint32_t *src = im->px + (size_t)y * im->w;
+      uint32_t *dst;
+      if (y0 + y < 0 || y0 + y >= c->h)
+         continue;
+      dst = c->px + (size_t)(y0 + y) * c->stride + x0;
+      for (x = 0; x < im->w; x++)
+      {
+         uint32_t s = src[x];
+         unsigned a = s >> 24, o;
+         if (!a || x0 + x < 0 || x0 + x >= c->w)
+            continue;
+         if (a == 255)
+         {
+            dst[x] = s;
+            continue;
+         }
+         o = dst[x];
+         a++;
+         dst[x] = 0xff000000 | ((((s >> 16 & 255) * a + (o >> 16 & 255) * (256 - a)) >> 8) << 16) |
+                  ((((s >> 8 & 255) * a + (o >> 8 & 255) * (256 - a)) >> 8) << 8) |
+                  (((s & 255) * a + (o & 255) * (256 - a)) >> 8);
+      }
+   }
+}
+
+typedef struct { font_t *tf; const char *title; int pw, ph; } titlepill_t;
+
+/* the row's name pill, drawn with its top left at (8, 4) on a canvas 18 px taller than the pill and 16 px wider */
+static void row_title_pill(canvas_t *c, const void *arg)
+{
+   const titlepill_t *tp = arg;
+   int pw = tp->pw, ph = tp->ph, px = 8, py0 = 4;
+   {
+      /* a soft shadow under the pill (only the rows below it are drawn, so it stays cheap) */
+      canvas_t sub = *c;
+      int top = py0 + ph - 8;
+      sub.px = c->px + (size_t)top * c->stride;
+      sub.h = 18;
+      fill_round_rect_alpha(&sub, px - 4, py0 + 5 - top, pw + 8, ph, ph / 2, 0x000000, 100);
+      fill_round_rect_alpha(&sub, px, py0 + 3 - top, pw, ph, ph / 2, 0x000000, 120);
+   }
    fill_round_rect(c, px - 2, py0 - 2, pw + 4, ph + 4, (ph + 4) / 2, 0xc0000000);   /* a dark edge, so it reads on any card */
    fill_round_rect(c, px, py0, pw, ph, ph / 2, C_ACCENT);
    {
@@ -4101,17 +6663,196 @@ static void draw_row_label(canvas_t *c, const char *title, int cy, int r)
             gfx_fill_rect(c, px + inset, py0 + j, pw - 2 * inset, 1, ((uint32_t)a << 24) | 0xffffff);
       }
    }
-   draw_centered(c, tf, title, c->w / 2, py0 + (ph - font_height(tf)) / 2, 0xffffffff);
+   draw_centered(c, tp->tf, tp->title, px + pw / 2, py0 + (ph - font_height(tp->tf)) / 2, 0xffffffff);
+}
+
+/* a screen's title as the same pill the rows' names use, centred on cx with its top at py0 (made once for each text) */
+static void draw_title_pill(canvas_t *c, const char *title, int cx, int py0)
+{
+   static struct { char key[96]; image_t img; } spr;
+   font_t *tf = f_label ? f_label : f_title ? f_title : f_small;
+   int ph = font_height(tf) + 6, pw = font_text_width(tf, title) + 48;
+   char key[96];
+   snprintf(key, sizeof(key), "%s,%d,%d,%06x", title, pw, ph, C_ACCENT & 0xffffff);
+   if (strcmp(key, spr.key) || !spr.img.px)
+   {
+      titlepill_t tp = { tf, title, pw, ph };
+      sprite_from_draw(&spr.img, pw + 16, ph + 18, row_title_pill, &tp);
+      snprintf(spr.key, sizeof(spr.key), "%s", key);
+   }
+   if (spr.img.px)
+      sprite_blit(c, &spr.img, cx - pw / 2 - 8, py0 - 4);
+}
+
+static void draw_row_label(canvas_t *c, const char *title, int cy, int r)
+{
+   /* The row's name as a big pill in the theme's accent, in large white letters, so it's
+    * plain which row you're on. Above the focused card, over the row that peeks out. */
+   static pillspr_t dspr;
+   static struct { char key[96]; image_t img; } tspr[NROWS + 1];   /* the name pills, one for each row, made when first needed */
+   font_t *tf = f_label ? f_label : f_title ? f_title : f_small;
+   int tw = font_text_width(tf, title), cnt = row_count(r), i;
+   int ph = font_height(tf) + 6, pw = tw + 48, px = c->w / 2 - pw / 2, py0 = cy - CARD_H / 2 - ph - 5;   /* (the gap above the card is about 60 px: stays clear of the row above) */
+   char key[96];
+   snprintf(key, sizeof(key), "%s,%d,%d,%06x", title, pw, ph, C_ACCENT & 0xffffff);
+   if (strcmp(key, tspr[r].key) || !tspr[r].img.px)
+   {
+      titlepill_t tp = { tf, title, pw, ph };
+      sprite_from_draw(&tspr[r].img, pw + 16, ph + 18, row_title_pill, &tp);
+      snprintf(tspr[r].key, sizeof(tspr[r].key), "%s", key);
+   }
+   if (tspr[r].img.px)
+      sprite_blit(c, &tspr[r].img, px - 8, py0 - 4);
    if (cnt > 1)
    {
       /* round dots on a small pill just big enough to hold them */
-      int x0 = c->w / 2 - cnt * 7 + 3, py = cy + 110;
-      fill_round_rect(c, x0 - 7, py - 1, cnt * 14 - 6 + 14, 22, 11, C_ACCENT);   /* the outline, in the row titles' purple */
-      fill_round_rect(c, x0 - 6, py, cnt * 14 - 6 + 12, 20, 10, TH(TH_DOTS));
+      int x0 = c->w / 2 - cnt * 7 + 3, py = cy + 110 + CARD_SLAB + 6;   /* clear of the card and its slab */
+      int dw = cnt * 14 - 6 + 12;
+      snprintf(key, sizeof(key), "%d,%06x,%06x,%d", dw, C_ACCENT & 0xffffff, TH(TH_DOTS) & 0xffffff, theme_glass_pill);
+      if (strcmp(key, dspr.key) || !dspr.img.px)
+      {
+         pill_sprite(&dspr, dw, 20, 1, C_ACCENT, theme_glass_pill ? 0.95f : 1.0f, TH(TH_DOTS), theme_glass_pill ? 0.55f : 1.0f, 0.0f, 0.50f);
+         snprintf(dspr.key, sizeof(dspr.key), "%s", key);
+      }
+      sprite_blit(c, &dspr.img, x0 - 6 - PILL_PAD, py - PILL_PAD);
       for (i = 0; i < cnt; i++)
          fill_round_rect(c, x0 + i * 14, py + 6, 8, 8, 4, i == ui.sel_[r] ? C_ACCENT : C_FAINT);
    }
 }
+
+/* Gentle stars in the sky of the home screen: STARS fixed points (made once from a fixed seed, so they are always in the same
+ * places) that each fade softly in and out on their own slow cycle (3 to 7 seconds); the bigger ones have a small cross. They are
+ * drawn over everything on the home screen except the cards of the focused row (their rectangles are left clear) and the
+ * labels drawn after them, so the cards of the rows above and below sparkle but the row you're on doesn't. The whole
+ * effect's strength is set in the Theme card (theme_stars: 0 is off, 100 all of them). At the idle
+ * redraw rate (about 10 a frame a second) the fading is smooth enough, and each star is a handful of pixels. */
+#define STARS 210   /* at 100%; the Theme card's slider sets how many of them show (50% = 105) */
+static struct { short x, y; unsigned char size, hue, saved; float phase, speed, peak; uint32_t under[25]; } stars[STARS];
+static int stars_made;
+
+static int theme_stars = 50;  /* how many of the home screen's twinkling stars show, 0..100 (Theme card: Stars slider; saved in theme.cfg) */
+static int theme_glint = 1;   /* the glint that sweeps across a card when it's chosen (Theme card: Glint On/Off) */
+
+typedef struct { int x, y, w, h; } rect_t;
+static int home_clean;       /* the screen is a finished quiet home frame that only the stars need touching up on */
+static double home_clean_t;
+static rect_t star_ex[28];   /* where the stars are kept out of in the last full home frame (see draw_home) */
+static int star_nex;
+
+/* Puts back what the stars covered (the 5x5 patches saved when they were drawn) */
+static void stars_restore(canvas_t *c)
+{
+   int i, sx, sy;
+   for (i = 0; i < STARS; i++)
+      if (stars[i].saved)
+      {
+         for (sy = 0; sy < 5; sy++)
+            for (sx = 0; sx < 5; sx++)
+               c->px[(size_t)(stars[i].y - 2 + sy) * c->stride + stars[i].x - 2 + sx] = stars[i].under[sy * 5 + sx];
+         stars[i].saved = 0;
+      }
+}
+
+static void stars_draw(canvas_t *c, double now, const rect_t *ex, int nex)
+{
+   int i, e;
+   for (i = 0; i < STARS; i++)
+      stars[i].saved = 0;   /* (only the ones drawn now have something to put back) */
+   if (theme_stars <= 0)
+      return;
+   if (!stars_made)
+   {
+      unsigned seed = 0x9e3779b9u;
+      int span = c->h - 52;   /* everywhere above the hint bar */
+      for (i = 0; i < STARS; i++)
+      {
+         seed = seed * 1664525u + 1013904223u;
+         stars[i].x = (short)(8 + (seed >> 8) % (unsigned)(c->w - 16));
+         seed = seed * 1664525u + 1013904223u;
+         stars[i].y = (short)(6 + (seed >> 8) % (unsigned)(span - 6));
+         seed = seed * 1664525u + 1013904223u;
+         stars[i].size = (seed >> 24) < 85 ? 2 : 1;   /* about one in three has a cross */
+         stars[i].hue = (unsigned char)((seed >> 16) & 3);
+         seed = seed * 1664525u + 1013904223u;
+         stars[i].phase = (seed >> 8) % 6283 / 1000.0f;
+         stars[i].speed = 0.9f + (seed >> 20) % 100 / 100.0f * 1.0f;   /* radians a second: 3 to 7 s a cycle */
+         stars[i].peak = 0.75f + (seed >> 4) % 26 / 100.0f;
+      }
+      stars_made = 1;
+   }
+   for (i = 0; i < STARS * theme_stars / 100; i++)
+   {
+      float tw = 0.5f + 0.5f * sinf((float)now * stars[i].speed + stars[i].phase);
+      float v = (0.12f + 0.88f * tw * tw) * stars[i].peak;   /* mostly dim with a soft peak, never quite out */
+      uint32_t col = stars[i].hue == 0 ? 0xffffe8c8u : stars[i].hue == 1 ? 0xffd8e4ffu : 0xffffffffu;
+      int x = stars[i].x, y = stars[i].y;
+      if (v < 0.04f)
+         continue;
+      for (e = 0; e < nex; e++)   /* (not over the cards of the focused row: their rectangles are left clear) */
+         if (x >= ex[e].x - 3 && x < ex[e].x + ex[e].w + 3 && y >= ex[e].y - 3 && y < ex[e].y + ex[e].h + 3)
+            break;
+      if (e < nex)
+         continue;
+      {
+         /* what is under it (a 5x5 patch), so a quiet frame can put it back and draw the stars again without redrawing the screen */
+         int sx, sy;
+         for (sy = 0; sy < 5; sy++)
+            for (sx = 0; sx < 5; sx++)
+               stars[i].under[sy * 5 + sx] = c->px[(size_t)(y - 2 + sy) * c->stride + x - 2 + sx];
+         stars[i].saved = 1;
+      }
+      {
+         /* on a light card (a white star would vanish) the star gets a soft dark halo and is drawn at full strength, so it
+          * reads as a point of light on a glossy surface */
+         uint32_t u = c->px[(size_t)y * c->stride + x];
+         int luma = (int)(((u >> 16 & 255) * 3 + (u >> 8 & 255) * 6 + (u & 255)) / 10);
+         if (luma > 135 && x > 1 && y > 1 && x < c->w - 2 && y < c->h - 2)
+         {
+            float h = v * 0.45f;
+            fill_px(c, x - 1, y, 0x401020, h);
+            fill_px(c, x + 1, y, 0x401020, h);
+            fill_px(c, x, y - 1, 0x401020, h);
+            fill_px(c, x, y + 1, 0x401020, h);
+            fill_px(c, x, y, 0xffffff, v > 0.35f ? 1.0f : v * 2.8f);
+            if (stars[i].size > 1)
+            {
+               fill_px(c, x - 2, y, 0xffffff, v * 0.8f);
+               fill_px(c, x + 2, y, 0xffffff, v * 0.8f);
+               fill_px(c, x, y - 2, 0xffffff, v * 0.8f);
+               fill_px(c, x, y + 2, 0xffffff, v * 0.8f);
+            }
+            continue;
+         }
+      }
+      fill_px(c, x, y, col, v);
+      if (stars[i].size > 1)
+      {
+         float a = v * 0.7f;
+         fill_px(c, x - 1, y, col, a);
+         fill_px(c, x + 1, y, col, a);
+         fill_px(c, x, y - 1, col, a);
+         fill_px(c, x, y + 1, col, a);
+         if (v > 0.5f)
+         {
+            fill_px(c, x - 2, y, col, a * 0.5f);
+            fill_px(c, x + 2, y, col, a * 0.5f);
+            fill_px(c, x, y - 2, col, a * 0.5f);
+            fill_px(c, x, y + 2, col, a * 0.5f);
+         }
+      }
+      else
+      {
+         /* a faint halo so a single pixel doesn't just flicker */
+         fill_px(c, x + 1, y, col, v * 0.4f);
+         fill_px(c, x, y + 1, col, v * 0.4f);
+         fill_px(c, x - 1, y, col, v * 0.2f);
+         fill_px(c, x, y - 1, col, v * 0.2f);
+      }
+   }
+}
+
+static int glint_r = -1, glint_i = -1;
+static double glint_t0, glint_until;   /* the glint on the chosen card: when it starts, and when frames can slow again */
 
 static void draw_home(canvas_t *c, double now)
 {
@@ -4120,7 +6861,9 @@ static void draw_home(canvas_t *c, double now)
    double focus_d = 9;
 
    double tb = PF_T(), tc;
+   bg_stage_on = 1;
    draw_background(c);
+   bg_stage_on = 0;
    PF_ADD(PF_BG, tb);
    for (r = 0; r < NROWS; r++)
    {
@@ -4133,7 +6876,7 @@ static void draw_home(canvas_t *c, double now)
       for (i = 0; i < cnt; i++)
       {
          double off = item_offset(r, i), sx = card_scale_x(fabs(off));
-         int cx = c->w / 2 + (int)(off * CARD_GAP * sy);
+         int cx = c->w / 2 + (int)(off * CARD_GAP * sy) + side_push(off);
          if (cx < -CARD_W || cx > c->w + CARD_W)
             continue;
          cards[n].r = r;
@@ -4149,8 +6892,86 @@ static void draw_home(canvas_t *c, double now)
    qsort(cards, n, sizeof(card_t), card_cmp);   /* far ones first, the focused card on top */
    smooth_budget = 2;
    tc = PF_T();
-   for (i = 0; i < n; i++)
-      draw_card(c, &cards[i], cards[i].r == focus_row && cards[i].i == ui.sel_[focus_row] && cards[i].depth < 0.5);
+   {
+      /* the focused card: its reflection goes down first (the other cards cover it where they meet), and once it has been
+       * on for a moment it gets its glint */
+      const card_t *fk = NULL;
+      for (i = 0; i < n; i++)
+         if (cards[i].r == focus_row && cards[i].i == ui.sel_[focus_row] && cards[i].depth < 0.5)
+            fk = &cards[i];
+      if (fk && !(fk->r == ROW_MEDIA && !media_has_logo(fk->i)))
+      {
+         cardimg_t *fci = card_image(fk->r, fk->i);
+         if (fci && fci->img.px)
+            card_reflection(c, fci, fk->cx - (int)(CARD_W * fk->scale) / 2, fk->cy - (int)(CARD_H * fk->scale) / 2,
+                            (int)(CARD_W * fk->scale), (int)(CARD_H * fk->scale), (int)(28 * fk->scale), (int)(CARD_SLAB * fk->scale + 0.5));
+      }
+      /* the glint belongs to the card that has just been chosen (the one the row is moving to), and starts the moment
+       * the button is pressed, while the card is still on its way in */
+      {
+         int tgt_i = ui.sel_[focus_row];
+         if (focus_row != glint_r || tgt_i != glint_i)
+         {
+            glint_r = focus_row;
+            glint_i = tgt_i;
+            glint_t0 = now;
+            glint_until = theme_glint ? now + 0.7 : 0;
+         }
+         for (i = 0; i < n; i++)
+         {
+            draw_card(c, &cards[i], cards[i].r == focus_row && cards[i].i == ui.sel_[focus_row] && cards[i].depth < 0.5);
+            if (theme_glint && cards[i].r == focus_row && cards[i].i == tgt_i && now >= glint_t0 && now < glint_t0 + 0.6 &&
+                !(focus_row == ROW_MEDIA && !media_has_logo(tgt_i)))
+            {
+               /* (drawn straight after its card, so the cards in front of it still cover it) */
+               int gw = (int)(CARD_W * cards[i].scale), gh = (int)(CARD_H * cards[i].scale);
+               card_glint(c, cards[i].cx - gw / 2, cards[i].cy - gh / 2, gw, gh, (int)(28 * cards[i].scale), (now - glint_t0) / 0.6);
+            }
+         }
+      }
+      {
+         rect_t *ex = star_ex;
+         int nex = 0;
+         for (i = 0; i < n && nex < 24; i++)
+            if (cards[i].r == focus_row && fabs(cards[i].rowd) < 0.5)
+            {
+               int cw = (int)(CARD_W * cards[i].scale), ch = (int)(CARD_H * cards[i].scale);
+               ex[nex].x = cards[i].cx - cw / 2;
+               ex[nex].y = cards[i].cy - ch / 2;
+               ex[nex].w = cw + CARD_SLAB;
+               ex[nex].h = ch + CARD_SLAB;
+               nex++;
+            }
+         if (focus_d < 0.5)
+         {
+            /* the things drawn over the stars afterwards (the row's name, the dots, the battery) are kept clear of them: a quiet
+             * frame puts back what a star covered, which would otherwise take those pixels back too */
+            font_t *tf = f_label ? f_label : f_title ? f_title : f_small;
+            int ph = font_height(tf) + 6, pw = font_text_width(tf, row_titles[focus_row]) + 48;
+            int cy = HOME_CY + (int)(row_offset(focus_row) * ROW_GAP), cnt = row_count(focus_row);
+            ex[nex].x = c->w / 2 - pw / 2 - 8;
+            ex[nex].w = pw + 16;
+            ex[nex].y = cy - CARD_H / 2 - ph - 14;
+            ex[nex].h = ph + 34;
+            nex++;
+            if (cnt > 1)
+            {
+               ex[nex].x = c->w / 2 - cnt * 7 - 14;
+               ex[nex].w = cnt * 14 + 28;
+               ex[nex].y = cy + 110 + CARD_SLAB - 6;
+               ex[nex].h = 44;
+               nex++;
+            }
+            ex[nex].x = 560;
+            ex[nex].y = 78;
+            ex[nex].w = c->w - 560;
+            ex[nex].h = 44;
+            nex++;
+         }
+         star_nex = nex;
+         stars_draw(c, now, ex, nex);
+      }
+   }
    PF_ADD(PF_CARDS, tc);
    tc = PF_T();
 
@@ -4420,6 +7241,7 @@ static const image_t *large_for(const entry_t *e)
 static void large_clear(void)
 {
    int i;
+   gcard_clear();   /* (the games carousel's cards hold those pictures too) */
    for (i = 0; i < LARGE_CACHE; i++)
    {
       image_free(large_c[i].img);
@@ -4439,7 +7261,218 @@ static void draw_folder_icon(canvas_t *c)
  * the Get Artwork program in the card's "Get Artwork" folder, run on a computer */
 #define ART_HINT_COLOUR 0x50b8a8d8   /* the faint text (see-through); the outline is the box colour lifted a little */
 
-static void draw_no_art_hint(canvas_t *c)
+/* A game with no picture shows its console's logo on a card-coloured plate instead of a message: the big one for the picture
+ * box (260x195) and a small one for the list's thumbnail square. Each is made once per console and kept; a theme change
+ * that touches the colours used makes them again. A console without a logo keeps the old words (big box) or the gray square. */
+#define SYSART_W 260
+#define SYSART_H 195
+static image_t *sysart[2][MAX_SYSTEMS];     /* [0] the picture box, [1] the thumbnail */
+static unsigned char sysart_none[2][MAX_SYSTEMS];
+static uint32_t sysart_sig;
+
+/* a console's colour, from its logo: the average of its colourful pixels (white and gray logos have none: the theme's accent) */
+static uint32_t sysart_colour(const image_t *logo)
+{
+   double r = 0, g = 0, b = 0, wsum = 0;
+   int i, n;
+   if (!logo)
+      return TH(TH_ACCENT);
+   n = logo->w * logo->h;
+   for (i = 0; i < n; i++)
+   {
+      uint32_t px = logo->px[i];
+      int pr = px >> 16 & 255, pg = px >> 8 & 255, pb = px & 255, mx, mn;
+      if ((px >> 24) < 200)
+         continue;
+      mx = pr > pg ? (pr > pb ? pr : pb) : (pg > pb ? pg : pb);
+      mn = pr < pg ? (pr < pb ? pr : pb) : (pg < pb ? pg : pb);
+      if (mx < 40)
+         continue;
+      {
+         double sat = (double)(mx - mn) / mx, w = sat * sat * sat;
+         r += pr * w;
+         g += pg * w;
+         b += pb * w;
+         wsum += w;
+      }
+   }
+   if (wsum < 8.0)
+      return TH(TH_ACCENT);
+   return 0xff000000 | (uint32_t)(r / wsum) << 16 | (uint32_t)(g / wsum) << 8 | (uint32_t)(b / wsum);
+}
+
+/* the little pictures that stand in for a game's thumbnail: a cartridge, or a disc for the disc-based consoles. Light from
+ * the top left like the menu's cards, so the shadow falls down and right. 24x24; no text. */
+static void glyph_cart(canvas_t *cv, int ox, int oy, uint32_t light, uint32_t dark, uint32_t label)
+{
+   /* a game cartridge: the wide body with grip ridges across the top and a label sticker, stepping in at the shoulders
+    * to the narrower foot that carries the contacts */
+   fill_round_rect_alpha(cv, ox + 5, oy + 4, 16, 14, 2, 0xff000000, 95);
+   fill_round_rect_alpha(cv, ox + 7, oy + 15, 12, 7, 1, 0xff000000, 95);
+   fill_round_rect(cv, ox + 4, oy + 3, 16, 14, 2, light);          /* the body */
+   fill_round_rect(cv, ox + 6, oy + 15, 12, 6, 1, light);          /* the foot */
+   fill_round_rect_alpha(cv, ox + 7, oy + 4, 10, 1, 0, dark, 170); /* the grip ridges */
+   fill_round_rect_alpha(cv, ox + 7, oy + 6, 10, 1, 0, dark, 170);
+   fill_round_rect(cv, ox + 6, oy + 8, 12, 7, 1, label);           /* the label */
+   fill_round_rect(cv, ox + 8, oy + 18, 8, 3, 0, dark);            /* the contacts */
+}
+
+static void glyph_disc(canvas_t *cv, int ox, int oy, uint32_t light, uint32_t dark, uint32_t hole)
+{
+   int x, y;
+   for (y = 0; y < 24; y++)
+      for (x = 0; x < 24; x++)
+      {
+         float d = hypotf(x + 0.5f - 12.0f, y + 0.5f - 12.0f), ds = hypotf(x + 0.5f - 13.0f, y + 0.5f - 13.0f), cov;
+         cov = 9.5f - ds;                                    /* the shadow */
+         if (cov > 0)
+            fill_px(cv, ox + x, oy + y, 0xff000000, (cov > 1 ? 1.0f : cov) * 0.37f);
+         cov = 9.5f - d;                                     /* the disc */
+         if (cov > 0)
+            fill_px(cv, ox + x, oy + y, light, cov > 1 ? 1.0f : cov);
+         cov = 1.0f - fabsf(d - 5.4f);                       /* the ring round the hub */
+         if (cov > 0 && d < 9.0f)
+            fill_px(cv, ox + x, oy + y, dark, cov * 0.45f);
+         cov = 3.1f - d;                                     /* the hole: what's behind the disc shows through */
+         if (cov > 0)
+            fill_px(cv, ox + x, oy + y, hole, cov > 1 ? 1.0f : cov);
+      }
+}
+
+static image_t *sysart_make(int sys, int small)
+{
+   char path[300];
+   image_t *logo = NULL, *im;
+   canvas_t cv;
+   int w = small ? THUMB_PX : SYSART_W, h = small ? THUMB_PX : SYSART_H, lw, lh, bw, bh;
+
+   snprintf(path, sizeof(path), "%s/%s.png", LOGO_DIR, systems[sys].id);
+   if (access(path, F_OK) == 0)
+      logo = image_load(path);
+   if (!logo && !small)
+      return NULL;
+   if (!(im = malloc(sizeof(*im))))
+   {
+      image_free(logo);
+      return NULL;
+   }
+   im->w  = w;
+   im->h  = h;
+   im->px = malloc((size_t)w * h * 4);
+   if (!im->px)
+   {
+      free(im);
+      image_free(logo);
+      return NULL;
+   }
+   cv.w = cv.stride = w;
+   cv.h = h;
+   cv.px = im->px;
+   gfx_fill_rect(&cv, 0, 0, w, h, small ? 0 : TH(TH_PICBOX));
+   if (small)
+   {
+      /* an icon with nothing behind it, like the hint bar's buttons: a cartridge, or a disc for the disc-based consoles,
+       * in a light tint of the console's colour. Painted once on black and once on white; the difference between the two
+       * gives each pixel's see-through amount, so the soft shadow stays soft over whatever the row looks like. */
+      uint32_t col = sysart_colour(logo);
+      const char *id = systems[sys].id;
+      int disc = !strcmp(id, "psx") || !strcmp(id, "segacd") || !strcmp(id, "pcenginecd") || !strcmp(id, "neogeocd")
+         || !strcmp(id, "fds");
+      uint32_t light = mix_colour(col, 0xffffffff, 215), dark = mix_colour(col, 0xff000000, 150);
+      static image_t *cart_img;
+      static int cart_tried;
+      uint32_t *onw = malloc((size_t)w * h * 4);
+      int pass, k;
+      if (!cart_tried)
+      {
+         cart_tried = 1;
+         cart_img   = image_load_mem(cartridge_icon_png, (int)sizeof(cartridge_icon_png));
+      }
+      if (!onw)
+      {
+         image_free(logo);
+         free(im->px);
+         free(im);
+         return NULL;
+      }
+      for (pass = 0; pass < 2; pass++)
+      {
+         cv.px = pass ? onw : im->px;
+         gfx_fill_rect(&cv, 0, 0, w, h, pass ? 0xffffffff : 0xff000000);
+         if (disc)
+            glyph_disc(&cv, 0, 0, light, dark, pass ? 0xffffffff : 0xff000000);
+         else if (cart_img)
+         {
+            cast_logo_shadow(&cv, cart_img, 2, 1, 20, 22, 1, 1, 1, 0xff000000, 120);
+            gfx_draw_image_smooth(&cv, cart_img, 2, 1, 20, 22);
+         }
+         else
+            glyph_cart(&cv, 0, 0, light, dark, mix_colour(col, 0xffffffff, 25));
+      }
+      for (k = 0; k < w * h; k++)
+      {
+         uint32_t bk = im->px[k], wh = onw[k];
+         int a = 255 - (int)((wh & 0xff) - (bk & 0xff)), ch, out = 0;   /* white minus black = what was see-through */
+         if (a < 0) a = 0;
+         if (a > 255) a = 255;
+         for (ch = 0; ch < 24; ch += 8)
+         {
+            int v = a ? (int)((bk >> ch & 0xff) * 255 / a) : 0;           /* the colour without the black behind it */
+            out |= (v > 255 ? 255 : v) << ch;
+         }
+         im->px[k] = (uint32_t)a << 24 | out;
+      }
+      free(onw);
+      image_free(logo);
+      return im;
+   }
+   fill_round_rect_vgrad(&cv, 10, 10, w - 20, h - 20, 12, TH(TH_CARDL_TOP), TH(TH_CARDL_BOT));
+   bw = w - 20 - 56;
+   bh = h - 20 - 64;
+   lw = bw;
+   lh = logo->h * lw / logo->w;
+   if (lh > bh)
+   {
+      lh = bh;
+      lw = logo->w * lh / logo->h;
+   }
+   if (lw < 1) lw = 1;
+   if (lh < 1) lh = 1;
+   /* lit from the top left like the menu's cards: the shadow falls down and right */
+   cast_logo_shadow(&cv, logo, (w - lw) / 2, (h - lh) / 2 - 4, lw, lh, 5, 8, 4,
+         mix_colour(TH(TH_CARDL_BOT), 0xff000000, 200), 190);
+   gfx_draw_image_scaled(&cv, logo, (w - lw) / 2, (h - lh) / 2 - 4, lw, lh);
+   image_free(logo);
+   return im;
+}
+
+static const image_t *sysart_get(int sys, int small)
+{
+   uint32_t sig = TH(TH_CARDL_TOP) * 31u ^ TH(TH_CARDL_BOT) * 17u ^ TH(TH_PICBOX) * 7u ^ (uint32_t)C_THUMB ^ TH(TH_ACCENT) * 13u;
+   if (sys < 0 || sys >= nsystems)
+      return NULL;
+   if (sig != sysart_sig)
+   {
+      int i, k;
+      for (k = 0; k < 2; k++)
+         for (i = 0; i < MAX_SYSTEMS; i++)
+         {
+            image_free(sysart[k][i]);
+            sysart[k][i] = NULL;
+            sysart_none[k][i] = 0;
+         }
+      sysart_sig = sig;
+   }
+   if (!sysart[small][sys] && !sysart_none[small][sys])
+   {
+      sysart[small][sys] = sysart_make(sys, small);
+      if (!sysart[small][sys])
+         sysart_none[small][sys] = 1;
+   }
+   return sysart[small][sys];
+}
+
+static void draw_no_art_text(canvas_t *c)
 {
    static const char *const words = "Plug the SD card into a computer and run Get Artwork from it to download box art.";
    int x = 567, y = LIST_Y + 15, w = 260, h = 195, lines = 0, ty, i;
@@ -4486,6 +7519,15 @@ static void draw_no_art_hint(canvas_t *c)
    draw_centered(c, f_small, "No picture yet", x + w / 2, ty, ART_HINT_COLOUR);
    for (i = 0; i < lines; i++)
       draw_centered(c, f_small, line[i], x + w / 2, ty + 28 + i * 22, ART_HINT_COLOUR);
+}
+
+static void draw_no_art_hint(canvas_t *c, int sys)
+{
+   const image_t *a = sysart_get(sys, 0);
+   if (a)
+      gfx_draw_image(c, a, 567, LIST_Y + 15);
+   else
+      draw_no_art_text(c);
 }
 
 /* what's inside the selected folder: a small list under its name. It comes from the library in memory (no
@@ -4698,6 +7740,8 @@ static void draw_list(canvas_t *c, double now)
          int ty = y + (ROW_H - THUMB_PX) / 2;
          if (th)
             gfx_draw_image(c, th, 26, ty);
+         else if ((th = sysart_get(e->sys, 1)))
+            gfx_draw_image(c, th, 26, ty);
          else
             gfx_fill_rect(c, 26, ty, THUMB_PX, THUMB_PX, C_THUMB);
       }
@@ -4740,7 +7784,7 @@ static void draw_list(canvas_t *c, double now)
          if (e->is_dir)
             draw_folder_icon(c);
          else
-            draw_no_art_hint(c);
+            draw_no_art_hint(c, e->sys);
       }
       display_name(e, name, sizeof(name));
       gfx_draw_text(c, f_mid, name, 567, LIST_Y + 225, C_TEXT, 260);
@@ -4762,14 +7806,539 @@ static void draw_list(canvas_t *c, double now)
 
    draw_hints(c, ui.list.n && ui.list.e[ui.sel].is_dir
          ? "A  Open folder     B  Back     Dpad  Navigation     L / R  Letter"
+         : ui.list_all && ui.coll == COLL_RECENT ? "A  Play     B  Back     Y  Favorite     Start  Remove     X  Search     Dpad  Navigation     L / R  Letter"
          : ui.list_all ? "A  Play     B  Back     Y  Favorite     X  Search     Dpad  Navigation     L / R  Letter"
          : "A  Play     B  Back     Y  Favorite     X  Search     Dpad  Navigation     L / R  Letter");
    draw_toast(c, now);
    draw_volume(c, now);
 }
 
+
+/* ---- the games carousel: its cards and its drawing (the data and the buttons are above, by reload_list).
+ * Each game's card is drawn once at full size (the card colour, the game's picture on it, or its console's logo when it has none)
+ * and then only scaled, like the home screen's; the last few are kept. */
+#define GC_CACHE 48
+static struct { cardimg_t ci; uint64_t key; unsigned stamp; } gcard[GC_CACHE];
+static unsigned gcard_clock;
+
+static void gcard_clear(void)
+{
+   int i;
+   for (i = 0; i < GC_CACHE; i++)
+      gcard[i].key = 0;   /* (each is drawn again when next shown) */
+}
+
+static uint64_t gcard_key(const entry_t *e)
+{
+   uint64_t h = 1469598103934665603ull;
+   const char *p;
+   for (p = systems[e->sys].id; *p; p++)
+      h = (h ^ (uint8_t)*p) * 1099511628211ull;
+   h = (h ^ '/') * 1099511628211ull;
+   for (p = e->name; *p; p++)
+      h = (h ^ (uint8_t)*p) * 1099511628211ull;
+   h = (h ^ TH(TH_CARDL_TOP)) * 1099511628211ull;   /* (the colours it is drawn in) */
+   h = (h ^ TH(TH_CARDL_BOT)) * 1099511628211ull;
+   h = (h ^ TH(TH_TEXT)) * 1099511628211ull;
+   return h | 1;
+}
+
+/* A picture's corners just barely rounded: the pixels of the card under each corner are kept before the picture goes down
+ * and put back (blended along the curve) outside radius r afterwards. r is at most 8. */
+static void art_corners_keep(const canvas_t *c, int x, int y, int w, int h, int r, uint32_t keep[4][64])
+{
+   int k, i, j;
+   for (k = 0; k < 4; k++)
+      for (j = 0; j < r; j++)
+         for (i = 0; i < r; i++)
+            keep[k][j * r + i] = c->px[(size_t)((k & 2 ? y + h - r : y) + j) * c->stride + (k & 1 ? x + w - r : x) + i];
+}
+
+static void art_corners_round(canvas_t *c, int x, int y, int w, int h, int r, uint32_t keep[4][64])
+{
+   int k, i, j;
+   double r1 = r - 1.0;
+   for (k = 0; k < 4; k++)
+   {
+      int x0 = k & 1 ? x + w - r : x, y0 = k & 2 ? y + h - r : y;
+      double cx = k & 1 ? x + w - r : x + r, cy = k & 2 ? y + h - r : y + r;
+      for (j = 0; j < r; j++)
+         for (i = 0; i < r; i++)
+         {
+            double dx = x0 + i + 0.5 - cx, dy = y0 + j + 0.5 - cy, d2 = dx * dx + dy * dy, d;
+            uint32_t *dst;
+            if (((k & 1) ? dx < 0 : dx > 0) || ((k & 2) ? dy < 0 : dy > 0) || d2 <= r1 * r1)
+               continue;   /* (inside the curve, or on the straight part of the edge) */
+            d = sqrt(d2);
+            dst = &c->px[(size_t)(y0 + j) * c->stride + x0 + i];
+            *dst = blend256(*dst, keep[k][j * r + i], d >= r ? 256 : (unsigned)((d - r1) * 256));
+         }
+   }
+}
+
+static void gcard_make(cardimg_t *ci, const entry_t *e)
+{
+   canvas_t cv;
+   const image_t *big;
+   uint32_t top = TH(TH_CARDL_TOP), bot = TH(TH_CARDL_BOT);
+   if (!ci->img.px)
+   {
+      ci->img.w = ci->img.h = GS;
+      ci->img.px = malloc((size_t)GS * GS * 4);
+      if (!ci->img.px)
+         return;
+   }
+   cv.w = cv.h = cv.stride = GS;
+   cv.px = ci->img.px;
+   {
+      /* the card colour with its shading is the same for every game: made once (again when the colours change) and copied */
+      static uint32_t *base, base_top, base_bot;
+      if (!base || base_top != top || base_bot != bot)
+      {
+         canvas_t bc = cv;
+         free(base);
+         base = malloc((size_t)GS * GS * 4);
+         if (base)
+         {
+            bc.px = base;
+            fill_vgradient(&bc, 0, 0, GS, GS, top, bot);
+            card_depth_sq(&bc, bot, 256);
+            base_top = top;
+            base_bot = bot;
+         }
+      }
+      if (base)
+         memcpy(cv.px, base, (size_t)GS * GS * 4);
+      else
+      {
+         fill_vgradient(&cv, 0, 0, GS, GS, top, bot);
+         card_depth_sq(&cv, bot, 256);
+      }
+   }
+   big = large_for(e);
+   if (big)
+   {
+      /* the picture, as large as fits inside the card with a margin, in its own shape, on a soft shadow */
+      int box = GS - 28, bw, bh, x, y, r = 6;
+      uint32_t keep[4][64];
+      double sc = (double)box / (big->w > big->h ? big->w : big->h);
+      bw = (int)(big->w * sc + 0.5);
+      bh = (int)(big->h * sc + 0.5);
+      x = (GS - bw) / 2;
+      y = (GS - bh) / 2;
+      fill_round_rect_alpha(&cv, x - 2, y + 2, bw + 4, bh + 4, r + 2, 0xff000000, 60);
+      fill_round_rect_alpha(&cv, x, y + 4, bw, bh, r, 0xff000000, 90);
+      if (bw >= 2 * r && bh >= 2 * r)
+         art_corners_keep(&cv, x, y, bw, bh, r, keep);
+      gfx_draw_image_smooth(&cv, big, x, y, bw, bh);
+      if (bw >= 2 * r && bh >= 2 * r)
+         art_corners_round(&cv, x, y, bw, bh, r, keep);
+   }
+   else
+   {
+      /* no picture: the console's logo, as on the cards of the Consoles row */
+      char path[300];
+      image_t *logo = NULL;
+      snprintf(path, sizeof(path), "%s/%s.png", LOGO_DIR, systems[e->sys].id);
+      if (access(path, F_OK) == 0)
+         logo = image_load(path);
+      if (logo)
+      {
+         int lw = logo->w > GS - 44 ? GS - 44 : logo->w, lh = logo->h * lw / logo->w, x, y;
+         if (lh > 100)
+         {
+            lw = lw * 100 / lh;
+            lh = 100;
+         }
+         x = GS / 2 - lw / 2;
+         y = (GS - lh) / 2 - 6;
+         cast_logo_shadow(&cv, logo, x, y, lw, lh, 5, 8, 4, mix_colour(bot, 0xff000000, 200), 190);
+         gfx_draw_image_scaled(&cv, logo, x, y, lw, lh);
+         image_free(logo);
+      }
+      else
+         draw_centered(&cv, f_mid, systems[e->sys].name, GS / 2, GS / 2 - font_height(f_mid) / 2, C_TEXT);
+   }
+   if (ci->half)
+      image_free(ci->half);
+   if (ci->scaled)
+      image_free(ci->scaled);
+   ci->half = image_half(&ci->img);
+   ci->scaled = NULL;
+   ci->last_w = ci->last_h = 0;
+}
+
+/* a game's card picture; with make = 0 only one that is already made. NULL when there is none yet (making one that
+ * would overrun the frame's time is left for the next frame). */
+static cardimg_t *gcard_get(const entry_t *e, int make)
+{
+   uint64_t key = gcard_key(e);
+   int i, victim = 0;
+   for (i = 0; i < GC_CACHE; i++)
+      if (gcard[i].key == key && gcard[i].ci.img.px)
+      {
+         gcard[i].stamp = ++gcard_clock;
+         return &gcard[i].ci;
+      }
+   if (!make)
+      return NULL;
+   if (card_spent > CARD_BUDGET)
+   {
+      card_pending = 1;
+      return NULL;
+   }
+   for (i = 1; i < GC_CACHE; i++)
+      if (gcard[i].stamp < gcard[victim].stamp)
+         victim = i;
+   {
+      double t0 = now_s();
+      cardimg_t *ci = &gcard[victim].ci;
+      gcard_make(ci, e);
+      gcard[victim].key = ci->img.px ? key : 0;
+      gcard[victim].stamp = ++gcard_clock;
+      card_spent += now_s() - t0;
+      return ci->img.px ? ci : NULL;
+   }
+}
+
+/* While the menu sits still, the cards that could come into view next are made (a few a frame, the nearest first: along the row
+ * you are on, then the rows above and below), so moving never has to make one in the middle of a slide. 1 if one was made. */
+static int gcard_prewarm(void)
+{
+   int dr, sgn, d, side, made = 0;
+   if (!gc.on)
+      return 0;
+   for (dr = 0; dr <= 2; dr++)
+      for (sgn = -1; sgn <= 1; sgn += 2)
+      {
+         int rr, span = dr ? 3 : 4;
+         const grow_t *g;
+         if (dr == 0 && sgn > 0)
+            continue;
+         rr = wrap(gc.row_pos + sgn * dr, gc.nrow);
+         g = &gc.row[rr];
+         for (d = 0; d <= span; d++)
+            for (side = -1; side <= 1; side += 2)
+            {
+               const entry_t *e;
+               if (d == 0 && side > 0)
+                  continue;
+               e = &ui.list.e[g->first + wrap(gc.pos[rr] + side * d, g->n)];
+               if (gcard_get(e, 0))
+                  continue;
+               gcard_get(e, 1);
+               made = 1;
+               if (card_spent > 0.012)
+                  return 1;
+            }
+      }
+   return made;
+}
+
+/* a card at some size on the screen, as draw_card does for the home screen's */
+static void draw_gcard(canvas_t *c, cardimg_t *ci, int cx, int cy, double scale, int focus)
+{
+   int w = (int)(GS * scale), h = w, x = cx - w / 2, y = cy - h / 2, slab_t = (int)(CARD_SLAB * scale + 0.5), r = (int)(28 * scale);
+   uint32_t bot = TH(TH_CARDL_BOT);
+   if (w < 8)
+      return;
+   card_shadow(c, x, y + slab_t, w, h, r, focus);
+   if (w == GS)
+      gfx_draw_image_smooth(c, &ci->img, x, y, w, h);              /* full size: a copy */
+   else if (ci->scaled && ci->scaled->w == w && ci->scaled->h == h)
+      gfx_draw_image_smooth(c, ci->scaled, x, y, w, h);            /* resting: the kept copy */
+   else if (w == ci->last_w && h == ci->last_h && smooth_budget > 0)
+   {
+      smooth_budget--;
+      if (ci->scaled)
+         image_free(ci->scaled);
+      ci->scaled = image_scaled(&ci->img, w, h);
+      gfx_draw_image_smooth(c, ci->scaled ? ci->scaled : &ci->img, x, y, w, h);
+   }
+   else
+      gfx_draw_image_fast(c, ci->half && w <= ci->half->w ? ci->half : &ci->img, x, y, w, h);
+   ci->last_w = w;
+   ci->last_h = h;
+   round_corners(c, x, y, w, h, r);
+   stroke_round_rect(c, x, y, w, h, r, TH(TH_CARD_LINE));
+   card_slab(c, x, y, w, h, r, slab_t, mix_colour(bot, 0xff000000, 110), mix_colour(bot, 0xff000000, 200));
+}
+
+/* a card whose picture isn't made (the rows above and below only peek in, so they don't make theirs): the plain card */
+static void draw_gplain(canvas_t *c, int cx, int cy, double scale)
+{
+   int w = (int)(GS * scale), x = cx - w / 2, y = cy - w / 2, r = (int)(28 * scale);
+   if (w < 8)
+      return;
+   fill_round_rect_vgrad(c, x, y, w, w, r, TH(TH_CARDL_TOP), TH(TH_CARDL_BOT));
+   stroke_round_rect(c, x, y, w, w, r, TH(TH_CARD_LINE));
+}
+
+#define GC_ROW_GAP 262     /* between rows: the ones above and below show only a sliver at the screen's edges */
+
+/* how far from the middle the cards sit: the two beside the chosen one, then the outer two coming in at the screen's edges */
+static double gc_x(double a)
+{
+   return a <= 1 ? 240 * a : a <= 2 ? 240 + 214 * (a - 1) : 454 + 196 * (a - 2);
+}
+
+static double gc_scale_y(double dy)
+{
+   return 1 - 0.38 * (dy < 1 ? dy : 1);
+}
+
+typedef struct
+{
+   int r, i, cx, cy;
+   double scale, depth, d;
+   cardimg_t *ci;
+} gcdraw_t;
+
+static int gc_cmp(const void *a, const void *b)
+{
+   const gcdraw_t *x = a, *y = b;
+   return x->depth < y->depth ? 1 : x->depth > y->depth ? -1 : 0;
+}
+
+/* the text cut to a width, with "..." in the middle... at the end */
+static void fit_text(font_t *f, const char *in, int maxw, char *out, size_t sz)
+{
+   size_t len;
+   snprintf(out, sz, "%s", in);
+   len = strlen(out);
+   while (len > 1 && font_text_width(f, out) > maxw)
+   {
+      len--;
+      while (len > 1 && ((unsigned char)out[len] & 0xc0) == 0x80)
+         len--;
+      memcpy(out + len, "\xe2\x80\xa6", 4);
+   }
+}
+
+static void draw_games_carousel(canvas_t *c, double now)
+{
+   static gcdraw_t cards[64];
+   static struct { char key[220]; image_t img; } pill;
+   int n = 0, rr, k, i, nrow = gc.nrow, frow = wrap(gc.row_pos, nrow), fcy = HOME_CY;
+   const entry_t *fe = &ui.list.e[ui.sel];
+   double fd_min = 9;
+   char text[260];
+
+   fold_sliding = 0;
+   fold_wake = 0;
+   card_pending = 0;
+   smooth_budget = 2;
+   bg_stage_on = 1;
+   draw_background(c);
+   bg_stage_on = 0;
+
+   for (rr = 0; rr < nrow; rr++)
+   {
+      grow_t *g = &gc.row[rr];
+      double d = fmod(rr - gc.row_anim, nrow), sy;
+      int cy, cnt = g->n, m = 0, idx[9];
+      double off[9];
+      if (d < -nrow / 2.0)
+         d += nrow;
+      if (d >= nrow / 2.0)
+         d -= nrow;
+      if (fabs(d) >= 1.4)
+         continue;
+      if (fabs(d) < fd_min)
+      {
+         fd_min = fabs(d);
+         if (rr == frow)
+            fcy = HOME_CY + (int)(d * GC_ROW_GAP);
+      }
+      sy = gc_scale_y(fabs(d));
+      cy = HOME_CY + (int)(d * GC_ROW_GAP);
+      if (cnt <= 9)
+         for (i = 0; i < cnt; i++)
+         {
+            double o = fmod(i - gc.anim[rr], cnt);
+            if (o < -cnt / 2.0)
+               o += cnt;
+            if (o >= cnt / 2.0)
+               o -= cnt;
+            idx[m] = i;
+            off[m++] = o;
+         }
+      else
+      {
+         int base = (int)floor(gc.anim[rr]);
+         for (k = -4; k <= 4; k++)
+         {
+            idx[m] = wrap(base + k, cnt);
+            off[m++] = base + k - gc.anim[rr];
+         }
+      }
+      for (k = 0; k < m && n < 64; k++)
+      {
+         double a = fabs(off[k]), sc = card_scale_x(a) * sy;
+         int cx = c->w / 2 + (int)(gc_x(a) * sy * (off[k] < 0 ? -1 : 1) + (off[k] < 0 ? -0.5 : 0.5));
+         if (cx + GS * sc / 2 < 0 || cx - GS * sc / 2 > c->w)
+            continue;
+         cards[n].r = rr;
+         cards[n].i = g->first + idx[k];
+         cards[n].cx = cx;
+         cards[n].cy = cy;
+         cards[n].scale = sc;
+         cards[n].depth = fabs(d) * 10 + a;
+         cards[n].d = d;
+         cards[n].ci = NULL;
+         n++;
+      }
+   }
+   qsort(cards, n, sizeof(gcdraw_t), gc_cmp);   /* far ones first, the chosen card on top */
+
+   /* the pictures, the nearest cards first (the row you are on makes its own; the others only use what is there) */
+   for (i = n - 1; i >= 0; i--)
+      cards[i].ci = gcard_get(&ui.list.e[cards[i].i], fabs(cards[i].d) < 0.5);
+
+   /* the chosen card's reflection goes down first (the cards in front cover it where they meet) */
+   for (i = 0; i < n; i++)
+      if (cards[i].depth < 0.5 && cards[i].ci)
+      {
+         int w = (int)(GS * cards[i].scale);
+         card_reflection(c, cards[i].ci, cards[i].cx - w / 2, cards[i].cy - w / 2, w, w, (int)(28 * cards[i].scale), (int)(CARD_SLAB * cards[i].scale + 0.5));
+      }
+
+   /* the glint on the card that has just been chosen */
+   if (gc.glint_sel != ui.sel)
+   {
+      gc.glint_sel = ui.sel;
+      gc.glint_t0 = now;
+      gc.glint_until = theme_glint ? now + 0.7 : 0;
+   }
+   for (i = 0; i < n; i++)
+   {
+      const gcdraw_t *k2 = &cards[i];
+      int focus = k2->depth < 0.5, w = (int)(GS * k2->scale);
+      if (k2->ci)
+         draw_gcard(c, k2->ci, k2->cx, k2->cy, k2->scale, focus);
+      else
+         draw_gplain(c, k2->cx, k2->cy, k2->scale);
+      if (focus && theme_glint && now >= gc.glint_t0 && now < gc.glint_t0 + 0.6)
+         card_glint(c, k2->cx - w / 2, k2->cy - w / 2, w, w, (int)(28 * k2->scale), (now - gc.glint_t0) / 0.6);
+   }
+
+   {
+      /* the twinkling stars, as on the home screen: kept off the chosen row's cards and the writing drawn over them afterwards
+       * (a quiet frame puts back what a star covered, which would take those pixels back too) */
+      rect_t *ex = star_ex;
+      int nex = 0, th = font_height(f_label ? f_label : f_mid);
+      for (i = 0; i < n && nex < 24; i++)
+         if (cards[i].depth < 0.5 || fabs(cards[i].d) < 0.5)
+         {
+            int w = (int)(GS * cards[i].scale);
+            ex[nex].x = cards[i].cx - w / 2;
+            ex[nex].y = cards[i].cy - w / 2;
+            ex[nex].w = w + CARD_SLAB;
+            ex[nex].h = w + CARD_SLAB;
+            nex++;
+         }
+      if (fd_min < 0.5)
+      {
+         ex[nex].x = c->w / 2 - 330;
+         ex[nex].w = 660;
+         ex[nex].y = fcy - GS / 2 - font_height(f_label ? f_label : f_title ? f_title : f_small) - 20;
+         ex[nex].h = 40;
+         nex++;
+         ex[nex].x = c->w / 2 - 300;
+         ex[nex].w = 600;
+         ex[nex].y = fcy + GS / 2 + CARD_SLAB;
+         ex[nex].h = 2 * th + font_height(f_small) + 32;
+         nex++;
+      }
+      ex[nex].x = 560;
+      ex[nex].y = 0;
+      ex[nex].w = c->w - 560;
+      ex[nex].h = 56;
+      nex++;
+      star_nex = nex;
+      stars_draw(c, now, ex, nex);
+   }
+
+   if (fd_min < 0.5)
+   {
+      /* the row's name above the chosen card, and under it the game's name in bold and where in the row it is */
+      font_t *tf = f_label ? f_label : f_title ? f_title : f_small, *nf = f_label ? f_label : f_mid;
+      int ph = font_height(tf) + 6, pw, py0, ty, line_h = font_height(nf), cx = c->w / 2;
+      titlepill_t tp;
+      fit_text(tf, gc.row[frow].title, 560, text, sizeof(text));
+      pw = font_text_width(tf, text) + 48;
+      py0 = fcy - GS / 2 - ph - 5;
+      snprintf(pill.key, sizeof(pill.key), "%s,%d,%d,%06x", text, pw, ph, C_ACCENT & 0xffffff);
+      tp.tf = tf;
+      tp.title = text;
+      tp.pw = pw;
+      tp.ph = ph;
+      {
+         static char last[220];
+         if (strcmp(last, pill.key) || !pill.img.px)
+         {
+            sprite_from_draw(&pill.img, pw + 16, ph + 18, row_title_pill, &tp);
+            snprintf(last, sizeof(last), "%s", pill.key);
+         }
+      }
+      if (pill.img.px)
+         sprite_blit(c, &pill.img, cx - pw / 2 - 8, py0 - 4);
+
+      ty = fcy + GS / 2 + CARD_SLAB + 12;
+      {
+         char name[512];
+         int tw, maxw = 560, fav;
+         {
+            /* a favorite has a small gold star to the left of its name */
+            char key[1300];
+            entry_key(fe, key, sizeof(key));
+            fav = is_fav(key);
+         }
+         display_name(fe, name, sizeof(name));
+         tw = font_text_width(nf, name);
+         if (tw <= maxw)
+         {
+            gfx_draw_text(c, nf, name, cx - tw / 2, ty, C_TEXT, maxw);
+            if (fav)
+               draw_star_big(c, cx - tw / 2 - 20, ty + line_h / 2, C_GOLD);
+            ty += line_h;
+         }
+         else
+         {
+            /* two lines, split at the space nearest the middle */
+            int len = (int)strlen(name), best = -1, w1, w2;
+            char l1[256], l2[256];
+            for (k = 0; k < len; k++)
+               if (name[k] == ' ' && (best < 0 || abs(k - len / 2) < abs(best - len / 2)))
+                  best = k;
+            if (best < 0)
+               best = len;
+            snprintf(l1, sizeof(l1), "%.*s", best, name);
+            snprintf(l2, sizeof(l2), "%s", best < len ? name + best + 1 : "");
+            w1 = font_text_width(nf, l1);
+            w2 = font_text_width(nf, l2);
+            gfx_draw_text(c, nf, l1, cx - (w1 > maxw ? maxw : w1) / 2, ty, C_TEXT, maxw);
+            if (fav)
+               draw_star_big(c, cx - (w1 > maxw ? maxw : w1) / 2 - 20, ty + line_h / 2, C_GOLD);
+            gfx_draw_text(c, nf, l2, cx - (w2 > maxw ? maxw : w2) / 2, ty + line_h, C_TEXT, maxw);
+            ty += 2 * line_h;
+         }
+         snprintf(name, sizeof(name), "%d / %d", wrap(gc.pos[frow], gc.row[frow].n) + 1, gc.row[frow].n);
+         draw_centered(c, f_small, name, cx, ty + 2, C_DIM);
+      }
+   }
+   draw_status(c, c->w - 16, 25, 0);   /* (the corner, as on the other screens: a long row name takes the middle) */
+   draw_toast(c, now);
+   draw_volume(c, now);
+   draw_hints(c, ui.list_all && ui.coll == COLL_RECENT
+         ? "A  Play     B  Back     Y  Favorite     Start  Remove     X  Search     Dpad  Navigation     L / R  Letter"
+         : ui.list_all && ui.coll == COLL_SEARCH
+         ? "A  Play     B  Back     Y  Favorite     X  Search     Dpad  Navigation     L / R  Letter"
+         : "A  Play     B  Back     Y  Favorite     X  Search     Dpad  Navigation     L / R  Letter");
+}
+
 /* ------------------------------------------------------------- settings screen */
-#define G36_VERSION "1.0"
+#define G36_VERSION "1.1"
 #define BACKLIGHT   BOARD_BACKLIGHT
 
 /* write "key = value" into g36/settings.cfg, keeping everything else as it is */
@@ -4886,6 +8455,8 @@ static const srow_t srows[] = {
    { S_HEAD,   "DISPLAY", NULL, NULL, 0, 0, 0 },
    { S_CHOICE, "Brightness", "brightness_percent", v_bright, 10, 50, 0 },
    { S_CHOICE, "Brightness at start-up", "startup_brightness", v_sbright, 11, -1, 0 },
+   { S_CHOICE, "Borders around games", "game_borders", v_onoff, 2, 1, 0 },
+   { S_CHOICE, "FPS counter in games", "fps_show", v_onoff, 2, 1, 0 },
    { S_HEAD,   "SOUND", NULL, NULL, 0, 0, 0 },
    { S_CHOICE, "Volume", NULL, v_vol, 11, 50, 0 },
    { S_CHOICE, "Volume at start-up", "startup_volume", v_svol, 12, -1, 0 },
@@ -4926,6 +8497,7 @@ static int srow_shown(int i)
    return srows[i].action != A_RESTART || st_power;
 }
 
+static void switch_prewarm(void);
 static void settings_open(void)
 {
    int i;
@@ -4937,6 +8509,7 @@ static void settings_open(void)
    st.about = 0;
    st.top = 0;
    st.editing_clock = 0;
+   switch_prewarm();
 }
 
 static void settings_move(int dir)
@@ -5048,6 +8621,194 @@ static int click_volume_adjust(int code)
          srows[st.sel].key && !strcmp(srows[st.sel].key, "click_volume");
 }
 
+/* The same with a colour for every row (the other one steps in a few bands, which shows on a shape this small) */
+static void fill_round_rect_vgrad_smooth(canvas_t *c, int x, int y, int w, int h, int r, uint32_t top_col, uint32_t bot_col)
+{
+   canvas_t sub = *c;
+   int j;
+   for (j = 0; j < h; j++)
+   {
+      if (y + j < 0 || y + j >= c->h)
+         continue;
+      sub.px = c->px + (size_t)(y + j) * c->stride;
+      sub.h = 1;
+      fill_round_rect(&sub, x, -j, w, h, r, mix_colour(top_col, bot_col, h > 1 ? 256 * j / (h - 1) : 0));
+   }
+}
+
+/* A phone-style switch for the On/Off settings: a pill (the accent colour with the knob at the right when on, a dull grey
+ * with the knob at the left when off) whose knob slides across when the setting changes. `id` picks the remembered state
+ * for each switch on screen (0 Glint, 1 Translucent pill, 2 Translucent bar, 3 USB debugging); `right` is its right edge. */
+#define SW_W 52
+#define SW_H 28
+#define SW_SLIDE 0.16
+static double switch_until;   /* the main loop keeps drawing at full rate until then */
+/* One switch drawn live with its track's top left at (x, y), the knob `p` of the way across (0 off, 1 on) */
+static void switch_live(canvas_t *c, int x, int y, double p, int sel)
+{
+   /* lit like the cards: the track is sunk into the panel (dark at the top where the rim shadows it, lighter below, a
+    * light lip on its lower edge), glowing in the accent when on; the knob is a dome (white at the top, a soft grey
+    * below, a gloss over its upper half) standing on a layered shadow */
+   int pk = (int)(p * 256), r = SW_H / 2, d = SW_H - 6, kx;
+   uint32_t acc = C_ACCENT;
+   uint32_t t_top = mix_colour(mix_colour(0xff25222c, 0xff000000, 40), mix_colour(acc, 0xff000000, 150), pk);
+   uint32_t t_bot = mix_colour(0xff55505f, mix_colour(acc, 0xffffffff, 60), pk);
+   if (p > 0.02)
+      fill_round_rect_alpha(c, x - 3, y - 3, SW_W + 6, SW_H + 6, r + 3, acc, (int)(p * 55));   /* the glow */
+   fill_round_rect_alpha(c, x, y + 1, SW_W, SW_H, r, 0xffffffff, sel ? 120 : 55);                 /* the lip below the rim */
+   fill_round_rect(c, x - 1, y - 1, SW_W + 2, SW_H + 1, r + 1, sel ? 0xffe6e2ec : 0xff14121a);    /* the rim */
+   fill_round_rect_vgrad_smooth(c, x, y, SW_W, SW_H - 1, r, t_top, t_bot);
+   kx = x + 3 + (int)(p * (SW_W - SW_H) + 0.5);
+   fill_round_rect_alpha(c, kx - 2, y + 4, d + 4, d + 4, d / 2 + 2, 0xff000000, 40);              /* its shadow, wide and soft */
+   fill_round_rect_alpha(c, kx - 1, y + 4, d + 2, d + 2, d / 2 + 1, 0xff000000, 70);              /* and close and darker */
+   fill_round_rect(c, kx, y + 3, d, d, d / 2, 0xff8f8a9c);                                        /* the knob's edge */
+   fill_round_rect_vgrad_smooth(c, kx + 1, y + 4, d - 2, d - 3, d / 2 - 1, 0xffffffff, 0xffc4c0cf);
+   fill_round_rect_alpha(c, kx + 4, y + 5, d - 8, d / 2 - 2, d / 4, 0xffffffff, 150);             /* the gloss */
+}
+
+/* Every position of a switch is a cached picture with see-through edges (the glow and shadows fade out into whatever is
+ * behind): SW_STEPS + 1 knob positions, for a chosen switch (the one being changed, so the slide is a run of pictures) and a
+ * plain one (only off and on). Each is made when first needed, and again if the accent colour changes. Drawing one live
+ * costs about 15 shaded shapes (0.85 ms). A picture's alpha comes from drawing the switch twice, on black and on white:
+ * what's behind shows through by (white - black), and the colour is what's left of the black one. */
+#define SW_PAD 6
+#define SW_STEPS 12
+static image_t sw_spr[2][SW_STEPS + 1];
+static uint32_t sw_spr_acc;
+
+static void switch_sprite(int sel, int k)
+{
+   static uint32_t *bk, *wh;
+   int sw = SW_W + 2 * SW_PAD, sh = SW_H + 2 * SW_PAD, i, n = sw * sh;
+   image_t *im = &sw_spr[sel][k];
+   canvas_t cb = { sw, sh, sw, NULL }, cw = { sw, sh, sw, NULL };
+   if (!bk)
+   {
+      bk = malloc((size_t)n * 4);
+      wh = malloc((size_t)n * 4);
+   }
+   if (!bk || !wh)
+      return;
+   if (!im->px)
+   {
+      im->px = malloc((size_t)n * 4);
+      im->w = sw;
+      im->h = sh;
+   }
+   if (!im->px)
+      return;
+   cb.px = bk;
+   cw.px = wh;
+   for (i = 0; i < n; i++)
+   {
+      bk[i] = 0xff000000;
+      wh[i] = 0xffffffff;
+   }
+   switch_live(&cb, SW_PAD, SW_PAD, (double)k / SW_STEPS, sel);
+   switch_live(&cw, SW_PAD, SW_PAD, (double)k / SW_STEPS, sel);
+   for (i = 0; i < n; i++)
+   {
+      int q, diff = 0, a;
+      uint32_t out = 0;
+      for (q = 0; q <= 16; q += 8)
+         diff += 255 - (int)((wh[i] >> q & 255) - (bk[i] >> q & 255));
+      a = diff / 3;   /* how much of what's behind is hidden */
+      a = a < 0 ? 0 : a > 255 ? 255 : a;
+      if (a > 0)
+         for (q = 0; q <= 16; q += 8)
+         {
+            int cc = (int)(bk[i] >> q & 255) * 255 / a;
+            out |= (uint32_t)(cc > 255 ? 255 : cc) << q;
+         }
+      im->px[i] = out | (uint32_t)a << 24;
+   }
+}
+
+
+/* the pictures are made with the accent colour: when it changes they're all dropped (and made again as needed) */
+static void switch_check_accent(void)
+{
+   int q, v;
+   if (sw_spr_acc == C_ACCENT)
+      return;
+   for (v = 0; v < 2; v++)
+      for (q = 0; q <= SW_STEPS; q++)
+      {
+         free(sw_spr[v][q].px);
+         sw_spr[v][q].px = NULL;
+      }
+   sw_spr_acc = C_ACCENT;
+}
+
+/* Made ahead, when a screen with switches opens (about 25 ms, once): every position of a chosen switch, off and on of the
+ * others, so no slide or first draw has to make one */
+static void switch_prewarm(void)
+{
+   int q, v, made = 0;
+   double t0 = now_s();
+   switch_check_accent();
+   for (v = 0; v < 2; v++)
+      for (q = 0; q <= SW_STEPS; q++)
+         if (!sw_spr[v][q].px && (v || q == 0 || q == SW_STEPS))
+         {
+            switch_sprite(v, q);
+            made++;
+         }
+   if (made)
+      mlog("switch pictures: %d made in %d ms", made, (int)((now_s() - t0) * 1000));
+}
+
+static void draw_switch(canvas_t *c, int id, int right, int cy, int on, int sel, double now)
+{
+   static struct { int on; double t, seen; } sw[10];
+   int x = right - SW_W, y = cy - SW_H / 2, k;
+   double p = on ? 1 : 0, dt;
+   if (now - sw[id].seen > 0.3 || now < sw[id].seen)
+   {
+      sw[id].on = on;   /* just came on screen: no slide */
+      sw[id].t = -10;
+   }
+   sw[id].seen = now;
+   if (sw[id].on != on)
+   {
+      sw[id].on = on;
+      sw[id].t = now;
+   }
+   dt = (now - sw[id].t) / SW_SLIDE;
+   if (dt < 1)
+   {
+      /* sliding: the knob part of the way across */
+      dt = dt < 0 ? 0 : dt;
+      p = dt * dt * (3 - 2 * dt);
+      p = on ? p : 1 - p;
+      switch_until = now + 0.1;
+   }
+   switch_check_accent();
+   k = (int)(p * SW_STEPS + 0.5);
+   if (!sel && k != 0 && k != SW_STEPS)
+   {
+      switch_live(c, x, y, p, sel);   /* (a switch moved by something else, e.g. Reset: not worth a set of pictures) */
+      return;
+   }
+   if (!sw_spr[sel ? 1 : 0][k].px)
+      switch_sprite(sel ? 1 : 0, k);
+   else if (sel && dt >= 1)
+   {
+      /* at rest on the chosen switch: make the knob's other positions, one a frame, so a slide never has to */
+      int q;
+      for (q = 0; q <= SW_STEPS; q++)
+         if (!sw_spr[1][q].px)
+         {
+            switch_sprite(1, q);
+            break;
+         }
+   }
+   if (sw_spr[sel ? 1 : 0][k].px)
+      sprite_blit(c, &sw_spr[sel ? 1 : 0][k], x - SW_PAD, y - SW_PAD);
+   else
+      switch_live(c, x, y, p, sel);
+}
+
 static void choice_text(int i, char *out, size_t sz)
 {
    int v = st.val[i];
@@ -5065,7 +8826,7 @@ static void choice_text(int i, char *out, size_t sz)
       snprintf(out, sz, v ? "%d minutes" : "Never", v);
    else if (!strcmp(key, "clock_24h"))
       snprintf(out, sz, "%s", v ? "24-hour" : "12-hour");
-   else if (!strcmp(key, "usb_debugging"))
+   else if (!strcmp(key, "usb_debugging") || !strcmp(key, "game_borders"))
       snprintf(out, sz, "%s", v ? "On" : "Off");
    else if (!strcmp(key, "click_volume"))
    {
@@ -5298,7 +9059,9 @@ static void draw_settings(canvas_t *c, double now)
       gfx_draw_text(c, f_mid, row->label, 44, y + (SET_ROW_H - font_height(f_mid)) / 2,
             row->kind == S_INFO ? C_DIM : sel ? C_TEXT : C_DIM, 400);
       val[0] = 0;
-      if (row->kind == S_CHOICE)
+      if (row->kind == S_CHOICE && row->key && (!strcmp(row->key, "usb_debugging") || !strcmp(row->key, "game_borders") || !strcmp(row->key, "fps_show")))
+         draw_switch(c, !strcmp(row->key, "usb_debugging") ? 3 : !strcmp(row->key, "fps_show") ? 8 : 4, c->w - 50, y + SET_ROW_H / 2, st.val[r], sel, now);
+      else if (row->kind == S_CHOICE)
          choice_text(r, val, sizeof(val));
 
       if (val[0])
@@ -5313,7 +9076,8 @@ static void draw_settings(canvas_t *c, double now)
          gfx_draw_text(c, f_mid, val, vx, y + (SET_ROW_H - font_height(f_mid)) / 2, col, 0);
       }
    }
-   draw_hints(c, srows[st.sel].kind == S_CHOICE ? "Dpad:UD  Move     Dpad:LR  Change     B  Back"
+   draw_hints(c, srows[st.sel].kind == S_CHOICE && srows[st.sel].nvals == 2 ? "Dpad:UD  Move     A  Switch     B  Back"
+         : srows[st.sel].kind == S_CHOICE ? "Dpad:UD  Move     Dpad:LR  Change     B  Back"
          : "Dpad:UD  Move     A  Select     B  Back");
    draw_toast(c, now);
    draw_volume(c, now);
@@ -5411,6 +9175,143 @@ static void draw_clock_edit(canvas_t *c)
    draw_centered(c, f_small, "Dpad  Field     Up / Down  Change     A  Save     B  Cancel", c->w / 2, y + h - 40, C_DIM);
 }
 
+/* a rounded rectangle with a vertical gradient and see-through (alpha 0-255), drawn in bands like the opaque one */
+static void fill_round_rect_vgrad_alpha(canvas_t *c, int x, int y, int w, int h, int r, uint32_t top_col, uint32_t bot_col, int alpha)
+{
+   int bands = h < 24 ? 4 : h / 4, b;
+   canvas_t sub = *c;
+   if (bands < 2)
+      bands = 2;
+   for (b = 0; b < bands; b++)
+   {
+      int y0 = y + h * b / bands, y1 = y + h * (b + 1) / bands, cy0 = y0 < 0 ? 0 : y0;
+      if (y1 <= y0 || y0 >= c->h || y1 <= 0)
+         continue;
+      sub.px = c->px + (size_t)cy0 * c->stride;
+      sub.h = y1 - cy0;
+      fill_round_rect_alpha(&sub, x, y - cy0, w, h, r, mix_colour(top_col, bot_col, 256 * b / (bands - 1)), alpha);
+   }
+}
+
+/* the card behind a prompt: a soft shadow, a see-through body that goes from a lighter top to a deeper bottom
+ * (the dimmed screen shows faintly through), a bright edge, and the accent rim along the top */
+static void draw_bubble_live(canvas_t *c, int x, int y, int w, int h)
+{
+   uint32_t top = mix_colour(C_PANEL, C_ACCENT, 52), bot = mix_colour(C_PANEL, 0xff000000, 60);
+   canvas_t sub = *c;
+   fill_round_rect_alpha(c, x - 10, y + 6, w + 20, h + 10, 26, 0xff000000, 40);
+   fill_round_rect_alpha(c, x - 5, y + 8, w + 10, h + 2, 21, 0xff000000, 70);
+   fill_round_rect_alpha(c, x - 1, y - 1, w + 2, h + 2, 17, 0xffffffff, 38);          /* the bright edge */
+   fill_round_rect_vgrad_alpha(c, x, y, w, h, 16, top, bot, 185);
+   fill_round_rect_alpha(c, x + 12, y + 5, w - 24, 1, 0, 0xffffffff, 28);                /* a light line under the rim */
+   sub.h = y + 4 < c->h ? y + 4 : c->h;                                                  /* the rim: the top four rows */
+   fill_round_rect(&sub, x, y, w, h, 16, C_ACCENT);
+}
+
+/* ...but drawn live that cost 77 ms a frame, so it is drawn once into a picture (with see-through edges and body) and that
+ * is put on the screen each frame; it is drawn again only when the size or the theme colours change */
+static void bubble_sprite_fn(canvas_t *cv, const void *arg)
+{
+   const int *wh = arg;
+   draw_bubble_live(cv, 14, 4, wh[0], wh[1]);
+}
+
+static void draw_bubble(canvas_t *c, int x, int y, int w, int h)
+{
+   static image_t pic;
+   static int kw, kh;
+   static uint32_t kpanel, kaccent;
+   int wh[2] = { w, h };
+   if (!pic.px || kw != w || kh != h || kpanel != C_PANEL || kaccent != C_ACCENT)
+   {
+      sprite_from_draw(&pic, w + 28, h + 28, bubble_sprite_fn, wh);
+      kw = w;
+      kh = h;
+      kpanel = C_PANEL;
+      kaccent = C_ACCENT;
+   }
+   if (!pic.px)
+   {
+      draw_bubble_live(c, x, y, w, h);
+      return;
+   }
+   {
+      /* Nothing under a prompt moves, so the blend of the card over the screen is done once and kept: each frame samples
+       * about every 37th pixel under the card, and if they are all as they were, the kept result is copied back. */
+      static uint32_t *kept, *seen;
+      static size_t kept_n;
+      static int kx, ky, kcw, kch, kvalid;
+      static uint32_t kpic_panel, kpic_accent;
+      int rx = x - 14, ry = y - 4, rw = pic.w, rh = pic.h, same = 0, r;
+      size_t n = (size_t)rw * rh, nseen = (n + 36) / 37, i;
+      if (rx < 0 || ry < 0 || rx + rw > c->w || ry + rh > c->h)
+      {
+         sprite_blit(c, &pic, rx, ry);
+         kvalid = 0;
+         return;
+      }
+      if (kept_n != n)
+      {
+         free(kept);
+         free(seen);
+         kept = malloc(n * 4);
+         seen = malloc(nseen * 4);
+         kept_n = n;
+         kvalid = 0;
+      }
+      if (!kept || !seen)
+      {
+         kept_n = 0;
+         sprite_blit(c, &pic, rx, ry);
+         return;
+      }
+      if (kvalid && kx == rx && ky == ry && kcw == rw && kch == rh && kpic_panel == C_PANEL && kpic_accent == C_ACCENT)
+      {
+         same = 1;
+         for (i = 0; i < nseen && same; i++)
+         {
+            size_t at = i * 37;
+            if (c->px[(size_t)(ry + at / rw) * c->stride + rx + at % rw] != seen[i])
+               same = 0;
+         }
+      }
+      if (same)
+      {
+         for (r = 0; r < rh; r++)
+            memcpy(c->px + (size_t)(ry + r) * c->stride + rx, kept + (size_t)r * rw, (size_t)rw * 4);
+         return;
+      }
+      for (i = 0; i < nseen; i++)
+      {
+         size_t at = i * 37;
+         seen[i] = c->px[(size_t)(ry + at / rw) * c->stride + rx + at % rw];
+      }
+      sprite_blit(c, &pic, rx, ry);
+      for (r = 0; r < rh; r++)
+         memcpy(kept + (size_t)r * rw, c->px + (size_t)(ry + r) * c->stride + rx, (size_t)rw * 4);
+      kx = rx;
+      ky = ry;
+      kcw = rw;
+      kch = rh;
+      kpic_panel = C_PANEL;
+      kpic_accent = C_ACCENT;
+      kvalid = 1;
+   }
+}
+
+/* a button on a prompt: the chosen one in the accent colour, the others in the selection colour, both a touch
+ * lighter at the top */
+static void draw_prompt_button(canvas_t *c, int x, int y, int w, int h, int chosen)
+{
+   uint32_t base = chosen ? C_ACCENT : C_SEL;
+   fill_round_rect_alpha(c, x, y + 3, w, h, 14, 0xff000000, 60);
+   fill_round_rect_vgrad(c, x, y, w, h, 14, mix_colour(base, 0xffffffff, chosen ? 45 : 22), mix_colour(base, 0xff000000, chosen ? 25 : 15));
+}
+
+/* A prompt is drawn in two parts: the still part (the dim, the card, the words), and the part that moves (the buttons, the
+ * switch). 0 draws both; 1 only the still part; 2 only the moving part, over a kept copy of the still part (see the main loop). */
+static int prompt_phase;
+
 /* a centred box with a title, up to two lines of notes and up to three buttons */
 /* a prompt with up to four lines of notes (note3 and note4 may be NULL) */
 static void draw_prompt4(canvas_t *c, const char *title, const char *note1, const char *note2, const char *note3,
@@ -5429,35 +9330,171 @@ static void draw_prompt4(canvas_t *c, const char *title, const char *note1, cons
          bw = need < most ? need : most;
    }
    bx = c->w / 2 - (nopts * bw + (nopts - 1) * gap) / 2;
-   gfx_fill_rect(c, 0, 0, c->w, c->h, 0xb0000000);
-   gfx_fill_rect(c, x, y, w, h, C_PANEL);
-   gfx_fill_rect(c, x, y, w, 4, C_ACCENT);
+   if (prompt_phase != 2)
    {
-      int tw = font_text_width(f_big, title);
-      if (tw > w - 40)
-         tw = w - 40;
-      gfx_draw_text(c, f_big, title, c->w / 2 - tw / 2, y + 30, C_TEXT, w - 40);
-   }
-   for (i = 0; i < 4; i++)
-      if (notes_txt[i])
+      gfx_fill_rect(c, 0, 0, c->w, c->h, 0xb0000000);
+      draw_bubble(c, x, y, w, h);
       {
-         int tw = font_text_width(f_small, notes_txt[i]);
+         int tw = font_text_width(f_big, title);
          if (tw > w - 40)
             tw = w - 40;
-         gfx_draw_text(c, f_small, notes_txt[i], c->w / 2 - tw / 2, y + 86 + i * 28, C_DIM, w - 40);
+         gfx_draw_text(c, f_big, title, c->w / 2 - tw / 2, y + 30, C_TEXT, w - 40);
       }
-   for (i = 0; i < nopts; i++)
-   {
-      int cx = bx + i * (bw + gap);
-      gfx_fill_rect(c, cx, by, bw, 44, choice == i ? C_ACCENT : C_SEL);
-      draw_centered(c, f_mid, opts[i], cx + bw / 2, by + 8, C_TEXT);
+      for (i = 0; i < 4; i++)
+         if (notes_txt[i])
+         {
+            int tw = font_text_width(f_small, notes_txt[i]);
+            if (tw > w - 40)
+               tw = w - 40;
+            gfx_draw_text(c, f_small, notes_txt[i], c->w / 2 - tw / 2, y + 86 + i * 28, C_DIM, w - 40);
+         }
    }
+   if (prompt_phase != 1)
+   {
+      for (i = 0; i < nopts; i++)
+      {
+         int cx = bx + i * (bw + gap);
+         draw_prompt_button(c, cx, by, bw, 44, choice == i);
+         draw_centered(c, f_mid, opts[i], cx + bw / 2, by + 8, C_TEXT);
+      }
+   }
+}
+
+/* a prompt with a switch ("Don't show again", as in the settings) above one button; choice 0 is the switch, 1 the button */
+static void draw_prompt_toggle(canvas_t *c, const char *title, const char *note1, const char *note2, const char *note3,
+      const char *note4, const char *toggle_text, const char *button, int choice, double now)
+{
+   const char *const notes_txt[4] = { note1, note2, note3, note4 };
+   int notes = (note1 != NULL) + (note2 != NULL) + (note3 != NULL) + (note4 != NULL), i;
+   int w = 560, y, x = c->w / 2 - w / 2, h, ty, cy, by, bw = 200, rw;
+   int tw = font_text_width(f_small, toggle_text), row = SW_W + 14 + tw;
+   ty = 86 + notes * 28 + (notes ? 12 : 0);   /* from the top of the bubble: where the switch row starts */
+   cy = ty + 22;
+   by = cy + 38;
+   h = by + 44 + 26;
+   y = (c->h - h) / 2 - 10;
+   if (prompt_phase != 2)
+   {
+      gfx_fill_rect(c, 0, 0, c->w, c->h, 0xb0000000);
+      draw_bubble(c, x, y, w, h);
+      {
+         int ttw = font_text_width(f_big, title);
+         if (ttw > w - 40)
+            ttw = w - 40;
+         gfx_draw_text(c, f_big, title, c->w / 2 - ttw / 2, y + 30, C_TEXT, w - 40);
+      }
+      for (i = 0; i < 4; i++)
+         if (notes_txt[i])
+         {
+            int nw = font_text_width(f_small, notes_txt[i]);
+            if (nw > w - 40)
+               nw = w - 40;
+            gfx_draw_text(c, f_small, notes_txt[i], c->w / 2 - nw / 2, y + 86 + i * 28, C_DIM, w - 40);
+         }
+   }
+   if (prompt_phase == 1)
+      return;
+   rw = row + 40;
+   if (choice == 0)
+      fill_round_rect(c, c->w / 2 - rw / 2, y + cy - 20, rw, 40, 14, C_SEL);
+   draw_switch(c, 5, c->w / 2 - row / 2 + SW_W, y + cy, prompt_toggle, choice == 0, now);
+   gfx_draw_text(c, f_small, toggle_text, c->w / 2 - row / 2 + SW_W + 14, y + cy - font_height(f_small) / 2,
+         choice == 0 ? C_TEXT : C_DIM, 0);
+   draw_prompt_button(c, c->w / 2 - bw / 2, y + by, bw, 44, choice == 1);
+   draw_centered(c, f_mid, button, c->w / 2, y + by + 8, C_TEXT);
 }
 
 static void draw_prompt(canvas_t *c, const char *title, const char *note1, const char *note2,
       const char *const *opts, int nopts, int choice)
 {
    draw_prompt4(c, title, note1, note2, NULL, NULL, opts, nopts, choice);
+}
+
+/* Nothing under a prompt moves, so its still part (the screen below, the dim, the card, the words) is drawn once and kept;
+ * after that a frame is that copy plus the buttons and the switch. It is drawn again about once a second (the clock, the
+ * battery), and whenever the prompt changes. */
+static uint32_t *frozen_px;
+static int frozen_ok, frozen_w, frozen_h;
+static uint32_t frozen_key;
+static double frozen_t;
+
+static uint32_t frozen_hash(uint32_t h, const char *str)
+{
+   for (; *str; str++)
+      h = (h ^ (uint8_t)*str) * 16777619u;
+   return h;
+}
+
+static int frozen_usable(const canvas_t *c, uint32_t key, double now)
+{
+   return frozen_ok && frozen_key == key && frozen_w == c->w && frozen_h == c->h && now - frozen_t < 1.0;
+}
+
+static void frozen_restore(canvas_t *c)
+{
+   int y;
+   for (y = 0; y < c->h; y++)
+      memcpy(c->px + (size_t)y * c->stride, frozen_px + (size_t)y * c->w, (size_t)c->w * 4);
+}
+
+static void frozen_save(const canvas_t *c, uint32_t key, double now)
+{
+   int y;
+   if (!frozen_px || frozen_w != c->w || frozen_h != c->h)
+   {
+      free(frozen_px);
+      frozen_px = malloc((size_t)c->w * c->h * 4);
+      frozen_w = c->w;
+      frozen_h = c->h;
+   }
+   if (!frozen_px)
+   {
+      frozen_ok = 0;
+      return;
+   }
+   for (y = 0; y < c->h; y++)
+      memcpy(frozen_px + (size_t)y * c->w, c->px + (size_t)y * c->stride, (size_t)c->w * 4);
+   frozen_key = key;
+   frozen_t = now;
+   frozen_ok = 1;
+}
+
+/* A screen that is the same as the one before: the last frame is kept, and each new one is compared with it (and the kept
+ * copy brought up to date). A still screen is then shown once, not 10 times a second, and drawn less often (see the main loop). */
+static uint32_t *last_px;
+static int last_w, last_h;
+
+static int frame_changed(const canvas_t *c)
+{
+   int y, changed = 0;
+   if (!last_px || last_w != c->w || last_h != c->h)
+   {
+      free(last_px);
+      last_px = malloc((size_t)c->w * c->h * 4);
+      last_w = c->w;
+      last_h = c->h;
+      changed = 1;
+      if (!last_px)
+         return 1;
+   }
+   for (y = 0; y < c->h; y++)
+   {
+      const uint32_t *row = c->px + (size_t)y * c->stride;
+      uint32_t *kept = last_px + (size_t)y * c->w;
+      if (changed || memcmp(kept, row, (size_t)c->w * 4))
+      {
+         memcpy(kept, row, (size_t)c->w * 4);
+         changed = 1;
+      }
+   }
+   return changed;
+}
+
+/* what is on the display is not the kept frame any more (video, the screen off): the next frame is always shown */
+static void frame_forget(void)
+{
+   free(last_px);
+   last_px = NULL;
 }
 
 #define PROMPT_POWER   1
@@ -5485,6 +9522,7 @@ static const char *const usb_opts[]   = { "Allow", "Not now" };
 static const char *const ok_opts[]    = { "OK" };
 static const char *const how_opts[]   = { "Play once", "This game", "This console" };
 static const char *const bios_opts[]  = { "Play anyway", "Cancel" };
+static const char *const psx_opts[]   = { "Don't show again", "Play" };   /* (the prompt opens on the second) */
 static const char *const sleep_state_opts[] = { "Start normally", "Load state" };   /* (the prompt opens on the second) */
 static const char *const reset_opts[] = { "Reset", "Cancel" };
 static const char *const delete_opts[] = { "Delete", "Cancel" };
@@ -7750,6 +11788,9 @@ static void menu_unload(void)
    }
    free(bg);
    bg = NULL;
+   free(bg_stage);
+   bg_stage = NULL;
+   bg_cur = NULL;
    pthread_mutex_lock(&vt_m);
    for (k = 0; k < VT_MAX; k++)
       if (vt[k].state == VT_LOADED || vt[k].state == VT_READY)
@@ -8181,7 +12222,7 @@ static void draw_media_carousel(canvas_t *c, double now)
    for (i = 0; i < cnt; i++)
    {
       double off = item_offset(ROW_MEDIA, i);
-      int cx = c->w / 2 + (int)(off * CARD_GAP);
+      int cx = c->w / 2 + (int)(off * CARD_GAP) + side_push(off);
       if (cx < -CARD_W || cx > c->w + CARD_W)
          continue;
       cards[n].r = ROW_MEDIA;
@@ -8812,7 +12853,7 @@ static void draw_hits(canvas_t *c, double now)
          shown = 1;
       }
       if (!shown && h->kind == H_GAME)
-         draw_no_art_hint(c);
+         draw_no_art_hint(c, sk.res.e[h->a].sys);
       else if (!shown)
       {
          image_t *word = gradient_mask(kind, 230, 80);
@@ -8933,8 +12974,24 @@ static int is_lettering(int i)
    return i >= TH_LET1 && i <= TH_LET_EDGE;
 }
 
+/* the light cards' two colours from a dark card colour and the accent: the card colour with a little accent, mixed towards
+ * white until it reaches the brightness where dark and white logos are both readable (see tone_card) */
+static void derive_light_cards(uint32_t card_top, uint32_t accent, uint32_t *top, uint32_t *bot)
+{
+   uint32_t tint = mix_colour(card_top, accent, 90);
+   *top = tone_card(tint, 0.27f);
+   *bot = tone_card(tint, 0.21f);
+}
+
 static uint32_t preset_colour(int p, int i)
 {
+   if (i == TH_CARDL_TOP || i == TH_CARDL_BOT)
+   {
+      uint32_t t, b, ct = p == 0 ? th[TH_CARD_TOP].def : 0xff000000 | presets[p].c[TH_CARD_TOP],
+               ac = p == 0 ? th[TH_ACCENT].def : 0xff000000 | presets[p].c[TH_ACCENT];
+      derive_light_cards(ct, ac, &t, &b);
+      return i == TH_CARDL_TOP ? t : b;
+   }
    return p == 0 ? th[i].def : 0xff000000 | presets[p].c[i];
 }
 
@@ -8944,8 +13001,23 @@ static void theme_changed(void)
    int i, r, k;
    for (i = 0; i < 5; i++)
       grad_logo[i].c = TH(TH_LET1 + i) & 0xffffff;
-   free(bg);
-   bg = NULL;
+   preview_defer = 1;
+   /* the background (half a second of work to build, both versions) only depends on these colours */
+   {
+      static uint32_t sig[6];
+      uint32_t now_sig[6] = { TH(TH_BG_TOP), TH(TH_BG_BOT), TH(TH_BG_LIGHT), TH(TH_ACCENT), (uint32_t)theme_skyline, (uint32_t)theme_sky_style };
+      if (memcmp(sig, now_sig, sizeof(sig)))
+      {
+         memcpy(sig, now_sig, sizeof(sig));
+         free(ctl_bgbuf);
+         ctl_bgbuf = NULL;
+         free(bg);
+         bg = NULL;
+         free(bg_stage);
+         bg_stage = NULL;
+         bg_cur = NULL;
+      }
+   }
    for (r = 0; r <= ROW_MEDIA; r++)
       for (k = 0; k < MAX_SYSTEMS; k++)
          card_cache[r][k].key[0] = 0;   /* each card is drawn again when next shown */
@@ -8962,8 +13034,10 @@ static void theme_save(void)
    int i;
    if (!f)
       return;
-   fprintf(f, "# G36 menu colours (RRGGBB). Delete this file for the default theme.\nname = %s\nlettering = %s\n",
-         theme_name, theme_lettering >= NPRESETS ? "theme" : presets[theme_lettering].name);
+   fprintf(f, "# G36 menu colours (RRGGBB). Delete this file for the default theme.\nname = %s\nlettering = %s\nstars = %d\nglint = %s\npill_glass = %s\nbar_glass = %s\ngames_carousel = %s\nskyline = %s\nskyline_style = %s\n",
+         theme_name, theme_lettering >= NPRESETS ? "theme" : presets[theme_lettering].name, theme_stars,
+         theme_glint ? "on" : "off", theme_glass_pill ? "on" : "off", theme_glass_bar ? "on" : "off",
+         theme_games_carousel ? "on" : "off", theme_skyline ? "on" : "off", theme_sky_style == 2 ? "forest" : theme_sky_style ? "mountains" : "city");
    for (i = 0; i < TH_COUNT; i++)
       fprintf(f, "%s = %06X\n", th[i].key, th[i].v & 0xffffff);
    if (!ferror(f) && fclose(f) == 0)
@@ -8976,7 +13050,9 @@ static void theme_load(void)
 {
    char line[200];
    FILE *f = fopen(THEME_FILE, "r");
-   int i;
+   int i, got_light = 0;
+   th[TH_CARDL_TOP].v = th[TH_CARDL_TOP].def = preset_colour(0, TH_CARDL_TOP);
+   th[TH_CARDL_BOT].v = th[TH_CARDL_BOT].def = preset_colour(0, TH_CARDL_BOT);
    if (f)
    {
       while (fgets(line, sizeof(line), f))
@@ -8989,6 +13065,20 @@ static void theme_load(void)
          v = trim(eq + 1);
          if (!strcmp(k, "name"))
             snprintf(theme_name, sizeof(theme_name), "%s", strcmp(v, "Default") ? v : "Midnight");
+         if (!strcmp(k, "stars"))
+            theme_stars = !strcmp(v, "off") ? 0 : !strcmp(v, "on") ? 50 : atoi(v) < 0 ? 0 : atoi(v) > 100 ? 100 : atoi(v);
+         if (!strcmp(k, "pill_glass"))
+            theme_glass_pill = strcmp(v, "off") != 0;
+         if (!strcmp(k, "bar_glass"))
+            theme_glass_bar = strcmp(v, "off") != 0;
+         if (!strcmp(k, "glint"))
+            theme_glint = strcmp(v, "off") != 0;
+         if (!strcmp(k, "games_carousel"))
+            theme_games_carousel = strcmp(v, "off") != 0;
+         if (!strcmp(k, "skyline"))
+            theme_skyline = strcmp(v, "off") != 0;
+         if (!strcmp(k, "skyline_style"))
+            theme_sky_style = !strcmp(v, "forest") ? 2 : !strcmp(v, "city") ? 0 : 1;
          if (!strcmp(k, "lettering"))
          {
             int q;
@@ -8999,9 +13089,15 @@ static void theme_load(void)
          }
          for (i = 0; i < TH_COUNT; i++)
             if (!strcmp(k, th[i].key) && strlen(v) >= 6)
+            {
                th[i].v = 0xff000000 | (uint32_t)strtoul(v, NULL, 16);
+               if (i == TH_CARDL_TOP)
+                  got_light = 1;
+            }
       }
       fclose(f);
+      if (!got_light)   /* a file from before the light cards had their own colours: what they looked like then */
+         derive_light_cards(th[TH_CARD_TOP].v, th[TH_ACCENT].v, &th[TH_CARDL_TOP].v, &th[TH_CARDL_BOT].v);
    }
    theme_changed();
 }
@@ -9013,15 +13109,16 @@ static void theme_preset(int p)
       th[i].v = is_lettering(i) && theme_lettering < NPRESETS ? preset_colour(theme_lettering, i) : preset_colour(p, i);
    snprintf(theme_name, sizeof(theme_name), "%s", presets[p].name);
    theme_changed();
+   switch_prewarm();   /* (the new accent's switch pictures, now rather than on the first slide) */
    theme_save();
 }
 
 /* the editor: rows are the preset, Reset, then the colours under their group names */
-enum { TR_LETTERING = -3, TR_PRESET = -2, TR_RESET = -1 };
+enum { TR_SKYLINE = -10, TR_SKYSTYLE = -9, TR_CAROUSEL = -8, TR_BARGLASS = -7, TR_PILLGLASS = -6, TR_GLINT = -5, TR_STARS = -4, TR_LETTERING = -3, TR_PRESET = -2, TR_RESET = -1 };
 static struct
 {
    int sel, top;          /* index into rows */
-   int rows[TH_COUNT + 3 + 8], nrows;   /* TR_PRESET, TR_RESET, colour index, or 1000 + group */
+   int rows[TH_COUNT + 7 + 10], nrows;   /* TR_PRESET, TR_RESET, colour index, or 1000 + group */
    int picking, field;    /* the colour picker is open; 0 hue, 1 saturation, 2 brightness */
    int h, s, v;
    uint32_t before;
@@ -9034,12 +13131,34 @@ static void theme_rows(void)
    te.nrows = 0;
    te.rows[te.nrows++] = TR_PRESET;
    te.rows[te.nrows++] = TR_LETTERING;
+   te.rows[te.nrows++] = TR_STARS;
+   te.rows[te.nrows++] = TR_GLINT;
+   te.rows[te.nrows++] = TR_PILLGLASS;
+   te.rows[te.nrows++] = TR_BARGLASS;
+   te.rows[te.nrows++] = TR_CAROUSEL;
+   te.rows[te.nrows++] = TR_SKYLINE;
+   te.rows[te.nrows++] = TR_SKYSTYLE;
    te.rows[te.nrows++] = TR_RESET;
-   for (i = 0; i < TH_COUNT; i++)
    {
-      if (th[i].group)
-         te.rows[te.nrows++] = 1000 + i;   /* a heading */
-      te.rows[te.nrows++] = i;
+      /* the colours, in the order shown: the light cards' two follow the dark cards', then the rest; a heading where the group changes */
+      int ord[TH_COUNT], no = 0, q;
+      const char *last = "";
+      for (i = 0; i <= TH_CARD_LINE; i++)
+         ord[no++] = i;
+      ord[no++] = TH_CARDL_TOP;
+      ord[no++] = TH_CARDL_BOT;
+      for (i = TH_CARD_LINE + 1; i < TH_CARDL_TOP; i++)
+         ord[no++] = i;
+      for (q = 0; q < no; q++)
+      {
+         i = ord[q];
+         if (th[i].group && strcmp(th[i].group, last))
+         {
+            te.rows[te.nrows++] = 1000 + i;   /* a heading */
+            last = th[i].group;
+         }
+         te.rows[te.nrows++] = i;
+      }
    }
 }
 
@@ -9383,6 +13502,7 @@ static void theme_open(void)
    theme_rows();
    te.sel = te.top = 0;
    te.picking = 0;
+   switch_prewarm();
    ui.view = 8;
 }
 
@@ -9427,6 +13547,7 @@ static int theme_key(int code)
       {
          te.picking = 0;
          snprintf(theme_name, sizeof(theme_name), "Custom");
+         switch_prewarm();   /* (the accent may have changed) */
          theme_save();
       }
       else if (code == BTN_EAST)
@@ -9434,6 +13555,7 @@ static int theme_key(int code)
          th[ci].v = te.before;   /* put it back */
          te.picking = 0;
          theme_changed();
+         switch_prewarm();
          theme_word_drop();
       }
       return 0;
@@ -9444,6 +13566,20 @@ static int theme_key(int code)
       do
          te.sel = (te.sel + d + te.nrows) % te.nrows;
       while (te.rows[te.sel] >= 1000);   /* headings can't be chosen */
+   }
+   else if (code == BTN_TL || code == BTN_TR)
+   {
+      /* to the first row of the previous / next section (the rows below a heading; the top block is the first) */
+      int q, cur = 0, starts[16], ns = 0;
+      starts[ns++] = 0;
+      for (q = 0; q + 1 < te.nrows && ns < 16; q++)
+         if (te.rows[q] >= 1000)
+            starts[ns++] = q + 1;
+      for (q = 0; q < ns; q++)
+         if (starts[q] <= te.sel)
+            cur = q;
+      cur = (cur + (code == BTN_TR ? 1 : te.sel == starts[cur] ? ns - 1 : 0) + (code == BTN_TR ? 0 : 0)) % ns;
+      te.sel = starts[cur];
    }
    else if ((code == KEY_LEFT || code == KEY_RIGHT) && te.rows[te.sel] == TR_PRESET)
    {
@@ -9462,6 +13598,44 @@ static int theme_key(int code)
       theme_save();
       theme_word_drop();
    }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT) && te.rows[te.sel] == TR_STARS)
+   {
+      theme_stars += code == KEY_LEFT ? -10 : 10;   /* a slider: 0 to 100 in steps of 10 */
+      theme_stars = theme_stars < 0 ? 0 : theme_stars > 100 ? 100 : theme_stars;
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_PILLGLASS)
+   {
+      theme_glass_pill = !theme_glass_pill;
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_BARGLASS)
+   {
+      theme_glass_bar = !theme_glass_bar;
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_GLINT)
+   {
+      theme_glint = !theme_glint;
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_CAROUSEL)
+   {
+      theme_games_carousel = !theme_games_carousel;
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_SKYLINE)
+   {
+      theme_skyline = !theme_skyline;
+      theme_changed();
+      theme_save();
+   }
+   else if ((code == KEY_LEFT || code == KEY_RIGHT || code == BTN_SOUTH) && te.rows[te.sel] == TR_SKYSTYLE)
+   {
+      theme_sky_style = (theme_sky_style + (code == KEY_LEFT ? 2 : 1)) % 3;
+      theme_changed();
+      theme_save();
+   }
    else if (code == BTN_SOUTH && te.rows[te.sel] == TR_RESET)
       return 1;
    else if (code == BTN_SOUTH && te.rows[te.sel] >= 0)
@@ -9479,9 +13653,125 @@ static int theme_key(int code)
 
 static void theme_reset(void)
 {
+   theme_stars = 50;
+   theme_glint = 1;
+   theme_glass_pill = 1;
+   theme_glass_bar = 1;
+   theme_games_carousel = 1;
+   theme_skyline = 1;
+   theme_sky_style = 1;
    theme_lettering = 0;
    theme_preset(0);
    theme_word_drop();
+}
+
+/* The Theme card's preview: the real home screen (Consoles row, the focused console) drawn into a canvas of its own, then
+ * averaged down to a quarter-ish size and put in the panel, so every colour, effect and toggle shows as it will on the
+ * home screen. It is drawn again only when a colour or one of the effect settings has changed (or cards are still catching
+ * up); otherwise the same picture, already scaled to the panel, is copied. The menu's own position is saved and put back,
+ * so the real home screen doesn't notice. */
+static void theme_preview(canvas_t *c, int x, int y, int w, int h, double now)
+{
+   static canvas_t off;
+   static uint32_t *half;
+   static image_t himg;
+   static double last;
+   static int settling, have, sw, sh;
+   static uint32_t last_sig, *scl;
+   uint32_t sig = 2166136261u;
+   int i;
+   if (!off.px)
+   {
+      off.w = off.stride = c->w;
+      off.h = c->h;
+      off.px = malloc((size_t)off.w * off.h * 4);
+      half = malloc((size_t)(off.w / 2) * (off.h / 2) * 4);
+      himg.w = off.w / 2;
+      himg.h = off.h / 2;
+      himg.px = half;
+      last = 0;
+   }
+   if (!off.px || !half)
+      return;
+   for (i = 0; i < TH_COUNT; i++)
+      sig = (sig ^ th[i].v) * 16777619u;
+   sig = (sig ^ (uint32_t)(theme_stars * 8 + theme_glint * 4 + theme_glass_pill * 2 + theme_glass_bar)) * 16777619u;
+   sig = (sig ^ (uint32_t)(theme_skyline * 4 + theme_sky_style)) * 16777619u;
+   if (preview_defer)
+   {
+      preview_defer = 0;
+      settling = 1;
+      last = now;   /* (the next frame does the work) */
+      card_pending = 1;
+   }
+   else if (!have || card_pending || sig != last_sig)
+   {
+      int row_pos = ui.row_pos, x2, y2;
+      double row_anim = ui.row_anim, anim[NROWS + 1];
+      for (i = 0; i <= NROWS; i++)
+         anim[i] = ui.anim_[i];
+      ui.row_pos = ROW_CONS;
+      ui.row_anim = ROW_CONS;
+      for (i = 0; i <= NROWS; i++)
+         ui.anim_[i] = ui.pos_[i];
+      card_pending = 0;
+      draw_home(&off, now);
+      ui.row_pos = row_pos;
+      ui.row_anim = row_anim;
+      for (i = 0; i <= NROWS; i++)
+         ui.anim_[i] = anim[i];
+      bg_stage_on = 0;
+      bg_cur = bg;   /* (the panel's own corners are cut from the plain background again) */
+      for (y2 = 0; y2 < himg.h; y2++)
+         for (x2 = 0; x2 < himg.w; x2++)
+         {
+            const uint32_t *p0 = off.px + (size_t)(2 * y2) * off.stride + 2 * x2, *p1 = p0 + off.stride;
+            uint32_t a = p0[0], b = p0[1], cc = p1[0], d = p1[1];
+            half[(size_t)y2 * himg.w + x2] = 0xff000000 |
+               ((((a >> 16 & 255) + (b >> 16 & 255) + (cc >> 16 & 255) + (d >> 16 & 255)) >> 2) << 16) |
+               ((((a >> 8 & 255) + (b >> 8 & 255) + (cc >> 8 & 255) + (d >> 8 & 255)) >> 2) << 8) |
+               (((a & 255) + (b & 255) + (cc & 255) + (d & 255)) >> 2);
+         }
+      last = now;
+      settling = card_pending;
+      last_sig = sig;
+      have = 1;
+      sw = 0;   /* (scaled again below) */
+   }
+   if (settling && now - last > 0.5)
+      settling = 0;   /* (a safety: never leave the wheel up) */
+   if (!have)
+      return;
+   if (sw != w || sh != h)
+   {
+      /* the picture, scaled to the panel once (not on every frame) */
+      canvas_t sc;
+      free(scl);
+      scl = malloc((size_t)w * h * 4);
+      if (!scl)
+         return;
+      sc.w = sc.stride = sw = w;
+      sc.h = sh = h;
+      sc.px = scl;
+      gfx_draw_image_smooth(&sc, &himg, 0, 0, w, h);
+   }
+   for (i = 0; i < h && y + i < c->h; i++)
+      memcpy(c->px + (size_t)(y + i) * c->stride + x, scl + (size_t)i * w, (size_t)w * 4);
+   if (settling)
+   {
+      /* some cards still show their old colours: a theme-coloured wash over the preview (a light at the top fading to the
+       * background's bottom colour; the old picture shows faintly through) with the video player's loading wheel */
+      uint32_t lt = mix_colour(TH(TH_BG_TOP), TH(TH_BG_LIGHT), 160), db = TH(TH_BG_BOT);
+      int xx, yy;
+      for (yy = 0; yy < h && y + yy < c->h; yy++)
+      {
+         uint32_t wash = mix_colour(lt, db, yy * 255 / h), *row = c->px + (size_t)(y + yy) * c->stride + x;
+         for (xx = 0; xx < w; xx++)
+            row[xx] = mix_colour(row[xx], wash, 235) | 0xff000000;
+      }
+      draw_spinner(c, x + w / 2, y + h / 2, now);
+   }
+   stroke_round_rect(c, x, y, w, h, 6, TH(TH_CARD_LINE));
 }
 
 #define TE_ROWS 11
@@ -9527,6 +13817,42 @@ static void draw_theme(canvas_t *c, double now)
                : theme_lettering ? presets[theme_lettering].name : "Default");
          gfx_draw_text(c, f_mid, val, 510 - font_text_width(f_mid, val), y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
       }
+      else if (r == TR_STARS)
+      {
+         gfx_draw_text(c, f_mid, "Stars", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         if (theme_stars)
+            snprintf(val, sizeof(val), "<  %d%%  >", theme_stars);
+         else
+            snprintf(val, sizeof(val), "<  Off  >");
+         gfx_draw_text(c, f_mid, val, 510 - font_text_width(f_mid, val), y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+      }
+      else if (r == TR_PILLGLASS || r == TR_BARGLASS)
+      {
+         gfx_draw_text(c, f_mid, r == TR_PILLGLASS ? "Translucent pill" : "Translucent bar", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         draw_switch(c, r == TR_PILLGLASS ? 1 : 2, 510, y + TE_ROW_H / 2, r == TR_PILLGLASS ? theme_glass_pill : theme_glass_bar, sel, now);
+      }
+      else if (r == TR_CAROUSEL)
+      {
+         gfx_draw_text(c, f_mid, "Games Carousel", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         draw_switch(c, 6, 510, y + TE_ROW_H / 2, theme_games_carousel, sel, now);
+      }
+      else if (r == TR_SKYLINE)
+      {
+         gfx_draw_text(c, f_mid, "Skyline", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         draw_switch(c, 7, 510, y + TE_ROW_H / 2, theme_skyline, sel, now);
+      }
+      else if (r == TR_SKYSTYLE)
+      {
+         gfx_draw_text(c, f_mid, "Skyline style", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         snprintf(val, sizeof(val), "<  %s  >", theme_sky_style == 2 ? "Forest" : theme_sky_style ? "Mountains" : "City");
+         gfx_draw_text(c, f_mid, val, 510 - font_text_width(f_mid, val), y + (TE_ROW_H - font_height(f_mid)) / 2,
+               sel ? C_TEXT : C_DIM, 0);
+      }
+      else if (r == TR_GLINT)
+      {
+         gfx_draw_text(c, f_mid, "Glint", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
+         draw_switch(c, 0, 510, y + TE_ROW_H / 2, theme_glint, sel, now);
+      }
       else if (r == TR_RESET)
          gfx_draw_text(c, f_mid, "Reset to defaults", 44, y + (TE_ROW_H - font_height(f_mid)) / 2, sel ? C_TEXT : C_DIM, 0);
       else
@@ -9539,27 +13865,14 @@ static void draw_theme(canvas_t *c, double now)
       }
    }
 
-   /* the preview: a card with its lettering, text, a chosen row, the bar */
+   /* the preview: the real home screen, made small (see theme_preview), with the list's text colours and the bar below it */
    {
-      int px = 552, py = 58, pw = 290, ph = 360, cx = px + 20, cy = py + 18, cw = pw - 40, chh = 120;
+      int px = 552, py = 58, pw = 290, ph = 360, cx = px + 10, cw = pw - 20;
       canvas_t sub = { pw, ph, c->stride, c->px + (size_t)py * c->stride + px };
       fill_vgradient(&sub, 0, 0, pw, ph, TH(TH_BG_TOP), TH(TH_BG_BOT));
       round_corners(c, px, py, pw, ph, 14);
-      {
-         canvas_t card = { cw, chh, c->stride, c->px + (size_t)cy * c->stride + cx };
-         fill_vgradient(&card, 0, 0, cw, chh, TH(TH_CARD_TOP), TH(TH_CARD_BOT));
-         stroke_round_rect(c, cx, cy, cw, chh, 14, TH(TH_CARD_LINE));
-      }
-      if (!te.word)
-         te.word = gradient_mask("Preview", cw - 30, 60);
-      if (te.word)
-      {
-         grad = grad_logo;
-         grad_edge = C_LET_EDGE;
-         draw_gradient_mask(c, te.word, cx + cw / 2, cy + (chh - gradient_height(te.word)) / 2 - 8, 0);
-      }
-      draw_centered(c, f_small, "12 games", cx + cw / 2, cy + chh - 30, C_DIM);
-      y = cy + chh + 16;
+      theme_preview(c, cx, py + 10, cw, cw * 480 / 854, now);
+      y = py + 10 + cw * 480 / 854 + 16;
       gfx_fill_rect(c, cx, y, cw, 28, C_SEL);
       gfx_fill_rect(c, cx, y, 4, 28, C_ACCENT);
       gfx_draw_text(c, f_mid, "Chosen game", cx + 12, y + (28 - font_height(f_mid)) / 2, C_TEXT, cw - 20);
@@ -9587,10 +13900,13 @@ static void draw_theme(canvas_t *c, double now)
       int ci = te.rows[te.sel], vals[3] = { te.h, te.s, te.v }, mx[3] = { 359, 100, 100 };
       fill_round_rect(c, x0 - 1, y0 - 1, w + 2, h + 2, 13, C_ACCENT);
       fill_round_rect(c, x0, y0, w, h, 12, C_PANEL);
-      snprintf(val, sizeof(val), "%s %s", th[ci].group ? th[ci].group : "", th[ci].label);
-      for (i = 0; i < TH_COUNT; i++)
-         if (i <= ci && th[i].group)
-            snprintf(val, sizeof(val), "%s: %s", th[i].group, th[ci].label);
+      snprintf(val, sizeof(val), "%s", th[ci].label);
+      for (i = te.sel; i >= 0; i--)   /* the heading above it in the list */
+         if (te.rows[i] >= 1000)
+         {
+            snprintf(val, sizeof(val), "%s: %s", th[te.rows[i] - 1000].group, th[ci].label);
+            break;
+         }
       gfx_draw_text(c, f_mid, val, x0 + 20, y0 + 14, C_TEXT, w - 140);
       fill_round_rect(c, x0 + w - 100, y0 + 12, 38, 30, 6, te.before);
       fill_round_rect(c, x0 + w - 58, y0 + 12, 38, 30, 6, th[ci].v);
@@ -9617,9 +13933,15 @@ static void draw_theme(canvas_t *c, double now)
       draw_hints(c, "Dpad:UD  Choose     Dpad:LR  Change     A  Keep     B  Cancel");
    }
    else
-      draw_hints(c, te.rows[te.sel] == TR_PRESET ? "Dpad:UD  Move     Dpad:LR  Theme     B  Back"
-            : te.rows[te.sel] == TR_LETTERING ? "Dpad:UD  Move     Dpad:LR  Change     B  Back"
-            : te.rows[te.sel] == TR_RESET ? "A  Reset     B  Back" : "A  Change colour     B  Back");
+   {
+      int tr = te.rows[te.sel];
+      draw_hints(c, tr == TR_PRESET ? "Dpad:UD  Move     Dpad:LR  Theme     L / R  Section     B  Back"
+            : tr == TR_LETTERING ? "Dpad:UD  Move     Dpad:LR  Change     L / R  Section     B  Back"
+            : tr == TR_STARS ? "Dpad:UD  Move     Dpad:LR  Fewer / more     L / R  Section     B  Back"
+            : tr == TR_SKYSTYLE ? "Dpad:UD  Move     Dpad:LR  Change     L / R  Section     B  Back"
+            : tr == TR_GLINT || tr == TR_PILLGLASS || tr == TR_BARGLASS || tr == TR_CAROUSEL || tr == TR_SKYLINE ? "Dpad:UD  Move     A  On / off     L / R  Section     B  Back"
+            : tr == TR_RESET ? "A  Reset     L / R  Section     B  Back" : "A  Change colour     L / R  Section     B  Back");
+   }
    draw_toast(c, now);
    draw_volume(c, now);
 }
@@ -9634,6 +13956,8 @@ int main(int argc, char **argv)
 
    int busy = 1, bat_level = 0, prompt = 0, prompt_choice = 1, screen_on = 1, launched = 0, held_dir = 0;
    int video_mode = 0, chat = 0, prewarm_more = 0, tip_done = 0;
+   int freezable = 0, use_frozen = 0, same_frames = 0;
+   uint32_t fkey = 0;
    canvas_t *dc;
 
    signal(SIGTERM, on_signal);
@@ -9654,6 +13978,8 @@ int main(int argc, char **argv)
       return 1;
    }
    input_open();
+   remap_load();
+   menu_map_apply();   /* the menu's own buttons, as set on the Controls screen */
    c = gfx_canvas();
    f_huge  = font_load(FONT, 50);
    f_big   = font_load(FONT, 30);
@@ -9754,6 +14080,22 @@ int main(int argc, char **argv)
    last_counts = now_s();
    ui.row_pos = ROW_CONS;   /* start on the consoles unless the saved state says otherwise */
    load_state();
+   if (!play_mode && !file_exists(BOOT_SEEN))
+   {
+      /* the first start since the handheld was switched on (/tmp is empty then): always open on Settings in the Tools row,
+       * so there is one known place to start from. Later starts (back from a game, a restart) keep the saved place. */
+      FILE *bf;
+      int ti;
+      ui.view = 0;
+      ui.list_all = 0;
+      ui.folder[0] = 0;
+      ui.row_pos = ROW_TOOLS;
+      for (ti = 0; ti < NTOOLS; ti++)
+         if (!strcmp(tool_names[ti], "Settings"))
+            ui.sel_[ROW_TOOLS] = ti;
+      if ((bf = fopen(BOOT_SEEN, "w")))
+         fclose(bf);
+   }
    ui.row_anim = ui.row_pos;
    for (i = 0; i < NROWS; i++)
       row_set(i, ui.sel_[i]);
@@ -9779,6 +14121,8 @@ run:
       key_event_t ev;
       double t = now_s();
       int moved = 0, wait_ms;
+
+      card_spent = 0;
 
       /* keep lists in step with the folders */
       if ((ui.view == 0 || ui.view == 1) && screen_on)
@@ -9824,7 +14168,7 @@ run:
 
       /* moving: draw every refresh (the page flip sets the pace); still: ~10 frames a
        * second. After the first button, take the rest without waiting. */
-      wait_ms = !screen_on ? 200 : (busy || prewarm_more) ? 0 : 100;
+      wait_ms = !screen_on ? 200 : (busy || prewarm_more || card_pending) ? 0 : 100;
       if (screen_on && !busy && ui.view == 1 && fold_wake > 0)
       {
          /* a folder's list is about to slide: be awake for the start, so it doesn't begin late */
@@ -9836,9 +14180,18 @@ run:
       }
       if (screen_on && ui.view == 4 && pl.kind == MK_VIDEO && !busy)
          wait_ms = player_wait_ms(player_paused() ? 100 : 20);
+      /* a screen that hasn't changed for a few frames is looked at less often (a button, or anything moving, is quick again;
+       * the Power button's hold and a folder about to slide keep their short waits) */
+      if (wait_ms == 100 && screen_on && !busy && same_frames >= 3 && ui.view != 4 && !power_down && !(ui.view == 1 && fold_wake > 0))
+         wait_ms = same_frames >= 12 ? 1000 : same_frames >= 6 ? 400 : 200;
+      /* a still screen with only stars twinkling (they take 3 to 7 seconds a cycle) needs about 5 frames a second, not 10 */
+      if (wait_ms == 100 && screen_on && !busy && home_clean && theme_stars > 0 && (ui.view == 0 || (ui.view == 1 && gc.on)) && now_s() - home_clean_t < 2.0)
+         wait_ms = bat_low ? 500 : 200;   /* (a low battery: 2 frames a second, about a third of the work) */
       while (input_next(&ev, wait_ms))
       {
          wait_ms = 0;
+         t = now_s();   /* (the wait may have been long: a button's time is when it came) */
+         home_clean = 0;
          last_input = t;
          last_key = t;   /* (last_input is also held up by a charger; this is the buttons only) */
 
@@ -9854,8 +14207,8 @@ run:
          }
          if (show_controls)
          {
-            /* any button closes the controls screen (and does nothing else) */
-            if (ev.value == 1)
+            /* the Controls screen takes the real buttons (input_set_raw) */
+            if (ev.value == 1 && remap_key(ev.code))
                show_controls = 0;
             if (ev.code == BTN_SELECT && ev.value == 0)
                select_down = 0;
@@ -9974,22 +14327,34 @@ run:
 
          if (prompt)
          {
-            if (ev.code == KEY_LEFT)
+            int toggle_prompt = prompt == PROMPT_LAUNCH_TIP || (prompt == PROMPT_BIOS && pending.psx && !pending.sleep);
+            if (toggle_prompt && (ev.code == KEY_UP || ev.code == KEY_DOWN))
+               prompt_choice ^= 1;
+            else if (ev.code == KEY_LEFT)
                prompt_choice = (prompt_choice + prompt_opts(prompt) - 1) % prompt_opts(prompt);
             else if (ev.code == KEY_RIGHT)
                prompt_choice = (prompt_choice + 1) % prompt_opts(prompt);
             else if (ev.code == BTN_EAST)
             {
                if (prompt == PROMPT_LAUNCH_TIP)
+               {
+                  if (prompt_toggle)
+                     set_setting("tips_left", 0);
                   launched = 1;   /* (B is "Play" here: the game was already chosen) */
+               }
                prompt = 0;
             }
             else if (ev.code == BTN_SOUTH)
             {
                int sleep_at = power_restart ? 2 : 1;   /* where Sleep is in the Power prompt */
+               if (toggle_prompt && prompt_choice == 0)
+               {
+                  prompt_toggle ^= 1;   /* the switch: flip it, stay here */
+                  continue;
+               }
                if (prompt == PROMPT_LAUNCH_TIP)
                {
-                  if (prompt_choice == 1)
+                  if (prompt_toggle)
                      set_setting("tips_left", 0);   /* never again */
                   launched = 1;
                   prompt = 0;
@@ -10057,6 +14422,13 @@ run:
                      }
                   }
                }
+               else if (prompt == PROMPT_BIOS && pending.psx)
+               {
+                  if (prompt_toggle)
+                     set_setting("psx_sticks_warned", 1);
+                  if (launch_core_checked(&systems[pending.sys], pending.rom, pending.core, 1) == 0)
+                     launched = 1;
+               }
                else if (prompt_choice == 0 && prompt == PROMPT_BIOS)
                {
                   mlog("launch warning: playing anyway");
@@ -10113,7 +14485,7 @@ run:
                if (r == 1)
                   launched = 1;
                else if (r == 2)
-                  show_controls = 1;
+                  show_controls = controls_open();
                else if (r == 3 || r == 4)
                {
                   prompt = r == 3 ? PROMPT_ERROR : PROMPT_BIOS;
@@ -10138,7 +14510,7 @@ run:
             if (r == 1)
                launched = 1;
             else if (r == 2)
-               show_controls = 1;
+               show_controls = controls_open();
             else if (r == 3 || r == 4)
             {
                prompt = r == 3 ? PROMPT_ERROR : PROMPT_BIOS;
@@ -10183,7 +14555,7 @@ run:
             else if ((ev.code == BTN_SOUTH && r == ROW_COLL && ui.sel_[r] == COLL_SEARCH) || ev.code == BTN_NORTH)
                search_open();   /* the Search card, or X from anywhere on the home screen */
             else if (ev.code == BTN_WEST)
-               show_controls = 1;   /* Y on the home screen: the controls */
+               show_controls = controls_open();   /* Y on the home screen: the controls */
             else if (ev.code == BTN_SOUTH && r == ROW_COLL && n)
                open_collection(ui.sel_[r], t);
             else if (ev.code == BTN_SOUTH && r == ROW_TOOLS && ui.sel_[r] == TOOL_RETROARCH)
@@ -10197,7 +14569,7 @@ run:
                ui.view = 2;
             }
             else if (ev.code == BTN_SOUTH && r == ROW_TOOLS && ui.sel_[r] == TOOL_CONTROLS)
-               show_controls = 1;
+               show_controls = controls_open();
             else if (ev.code == BTN_SOUTH && r == ROW_TOOLS && ui.sel_[r] == TOOL_THEME)
                theme_open();
             else if (ev.code == BTN_SOUTH && r == ROW_TOOLS && ui.sel_[r] == TOOL_CHAT)
@@ -10245,6 +14617,8 @@ run:
                settings_change(1);
             else if (ev.code == BTN_EAST)
                ui.view = 0;
+            else if (ev.code == BTN_SOUTH && srows[st.sel].kind == S_CHOICE && srows[st.sel].nvals == 2)
+               settings_change(st.val[st.sel] == srows[st.sel].vals[1] ? -1 : 1);   /* A flips an on/off switch */
             else if (ev.code == BTN_SOUTH && srows[st.sel].kind == S_ACTION)
             {
                int a = srows[st.sel].action;
@@ -10294,7 +14668,9 @@ run:
          }
          else if (ui.view == 1)
          {
-            if (ev.code == KEY_UP && ui.list.n)
+            if (gc.on && gc_nav(ev.code, t))
+               ;   /* (the games carousel: along its rows, between them, by letter) */
+            else if (ev.code == KEY_UP && ui.list.n)
                ui.sel = (ui.sel + ui.list.n - 1) % ui.list.n;
             else if (ev.code == KEY_DOWN && ui.list.n)
                ui.sel = (ui.sel + 1) % ui.list.n;
@@ -10313,11 +14689,33 @@ run:
                   int keep = ui.sel;
                   reload_list();
                   ui.sel = keep < ui.list.n ? keep : ui.list.n - 1;
+                  gc_focus();
                   if (!ui.list.n)
                   {
                      ui.view = 0;
                      ui.list_all = 0;
                   }
+               }
+            }
+            else if (ev.code == BTN_START && ui.list_all && ui.coll == COLL_RECENT && ui.list.n && !ui.list.e[ui.sel].is_dir)
+            {
+               /* Start in Recently Played: this game leaves the list */
+               char key[1300];
+               int keep = ui.sel;
+               entry_key(&ui.list.e[ui.sel], key, sizeof(key));
+               remove_recent(key);
+               mlog("removed from Recently Played: %s", key);
+               load_collections();
+               reload_list();
+               ui.sel = keep < ui.list.n ? keep : ui.list.n - 1;
+               if (ui.sel < 0)
+                  ui.sel = 0;
+               gc_focus();   /* (the carousel follows the choice) */
+               toast("Removed from Recently Played", t);
+               if (!ui.list.n)
+               {
+                  ui.view = 0;
+                  ui.list_all = 0;
                }
             }
             else if ((ev.code == KEY_LEFT || ev.code == KEY_RIGHT) && ui.list_all)
@@ -10427,6 +14825,7 @@ run:
          moved = 1;
       }
       (void)moved;
+      t = now_s();   /* (and so is the frame's, after a long wait with nothing) */
 
       /* the first few launches: a tip on sleeping and powering off, before the menu hands over */
       if (launched && !tip_done)
@@ -10438,7 +14837,8 @@ run:
             set_setting("tips_left", left - 1);
             launched = 0;
             prompt = PROMPT_LAUNCH_TIP;
-            prompt_choice = 0;
+            prompt_choice = 1;   /* on the button */
+            prompt_toggle = 0;
             held_dir = 0;
             screen_on = 1;
          }
@@ -10568,6 +14968,7 @@ run:
          int level = battery_level();
          bat_check = t;
          st_battery = level;
+         bat_low = level >= 0 && level <= setting_int("battery_warn_percent", 20) && !external_power();
          screen_off_s = setting_int("screen_off_seconds", 180);
          power_off_min = setting_int("auto_power_off_minutes", 10);
          if (external_power())
@@ -10595,7 +14996,12 @@ run:
          repeat_at = t + 0.07;
          if (!click_volume_adjust(held_dir))
             key_click();
-         if (ui.view == 1 && ui.list.n)
+         if (ui.view == 1 && gc.on)
+         {
+            repeat_at = t + (held_dir == KEY_LEFT || held_dir == KEY_RIGHT ? 0.1 : 0.2);
+            gc_nav(held_dir, t);
+         }
+         else if (ui.view == 1 && ui.list.n)
          {
             if (held_dir == KEY_UP && ui.sel > 0)
                ui.sel--;
@@ -10652,6 +15058,11 @@ run:
                settings_move(held_dir == KEY_UP ? -1 : 1);
             else
                settings_change(held_dir == KEY_LEFT ? -1 : 1);
+         }
+         else if (ui.view == 0 && (held_dir == KEY_UP || held_dir == KEY_DOWN))
+         {
+            repeat_at = t + 0.18;   /* held: on through the rows, as Left / Right go on along one */
+            ui.row_pos += held_dir == KEY_UP ? -1 : 1;
          }
          else if (ui.view == 0 && row_count(cur_row()) && (held_dir == KEY_LEFT || held_dir == KEY_RIGHT))
          {
@@ -10747,9 +15158,14 @@ run:
       ui.row_anim += (ui.row_pos - ui.row_anim) * 0.3;
       if (fabs(ui.row_pos - ui.row_anim) < 0.01)
          ui.row_anim = ui.row_pos;
+      gc_moving = ui.view == 1 ? gc_ease() : 0;   /* the games carousel's rows and cards */
 
       /* anything still moving (or a button held) keeps the frame rate up */
-      busy = ui.row_anim != ui.row_pos || held_dir || t < ui.toast_until || t < vol_until || (ui.view == 1 && fold_sliding);
+      if (show_controls && rm.capture && t > rm.capture_until)
+         rm.capture = 0;   /* nothing pressed in time: the change is dropped */
+      busy = ui.row_anim != ui.row_pos || held_dir || (show_controls && rm.capture) || t < ui.toast_until || t < vol_until || (ui.view == 1 && fold_sliding) ||
+             (ui.view == 1 && gc.on && (gc_moving || t < gc.glint_until)) ||
+             (ui.view == 0 && t < glint_until) || t < switch_until;
       for (i = 0; i <= ROW_MEDIA; i++)
          if (ui.anim_[i] != ui.pos_[i])
             busy = 1;
@@ -10758,9 +15174,27 @@ run:
       prewarm_more = 0;
       if (ui.view == 0 && !busy && !prompt && !show_controls && t - last_key > 0.4)
          prewarm_more = card_prewarm();
+      else if (ui.view == 1 && gc.on && !busy && !prompt && !show_controls && t - last_key > 0.25)
+         prewarm_more = gcard_prewarm();
 
       video_mode = ui.view == 4 && pl.kind == MK_VIDEO;
       dc = c;
+      {
+         /* the prompt's frozen frame (see frozen_save): which prompt, and the words it shows, make its key */
+         freezable = prompt && prompt != PROMPT_CORE && !show_controls && !video_mode && !timing && screen_on && !st.editing_clock;
+         if (freezable)
+         {
+            fkey = frozen_hash(2166136261u, err_title);
+            fkey = frozen_hash(fkey, err_line1);
+            fkey = frozen_hash(fkey, err_line2);
+            fkey = (fkey ^ (uint32_t)(prompt * 977 + pending.psx * 31 + pending.sleep * 53 + power_restart * 71 + bat_level * 7 +
+                    ui.view * 131 + pick.sel * 17 + pick.sys * 257)) * 16777619u;
+         }
+         else
+            frozen_ok = 0;
+         /* (a toast or the volume bar is part of the screen below, so while one shows the screen is drawn each frame) */
+         use_frozen = freezable && frozen_usable(c, fkey, t) && t >= ui.toast_until && t >= vol_until;
+      }
       if (video_mode)
       {
          /* a video: the picture goes straight to the screen, with the controls on top */
@@ -10771,10 +15205,34 @@ run:
       {
          /* frame timing (temporary): kill -USR2 toggles logging of draw and present times */
          static double acc_d, acc_p, max_d, max_p;
+         if (!screen_on)
+            home_clean = 0;   /* (the canvas was blacked for the power-off: nothing of the old screen to touch up) */
          static int frames;
          double t0 = now_s(), t1, t2;
-         if (ui.view == 0)
-            draw_home(c, t);
+         if (use_frozen)
+            frozen_restore(c);
+         else if (ui.view == 0 || (ui.view == 1 && gc.on))
+         {
+            /* A quiet home screen (or games carousel) (nothing moving, no overlay, no button for a moment) only has the stars twinkling: the
+             * patches under them are put back and the stars drawn again, instead of drawing the whole screen. The whole
+             * screen is drawn again about once a second (the battery, the counts) and after any button. */
+            int quiet = !busy && !prompt && !show_controls && !card_pending && screen_on;
+            if (quiet && home_clean && t - home_clean_t < 2.0 && theme_stars > 0)
+            {
+               stars_restore(c);
+               stars_draw(c, t, star_ex, star_nex);
+            }
+            else
+            {
+               card_pending = 0;
+               if (ui.view == 1)
+                  draw_games_carousel(c, t);
+               else
+                  draw_home(c, t);
+               home_clean = quiet;
+               home_clean_t = t;
+            }
+         }
          else if (ui.view == 2)
          {
             if (st.about)
@@ -10798,6 +15256,8 @@ run:
             draw_gallery(c, t);
          else if (ui.view == 4)
             draw_music(c, t);
+         else if (ui.view == 1 && gc.on)
+            draw_games_carousel(c, now_s());
          else
             draw_list(c, now_s());
          t1 = now_s();
@@ -10826,59 +15286,79 @@ run:
             continue;   /* timing mode: home/list only, no prompts */
          }
       }
-      if (prompt == PROMPT_POWER)
       {
-         if (power_restart)
-            draw_prompt(dc, "Power off?", NULL, NULL, power_opts, 4, prompt_choice);
-         else
-            draw_prompt(dc, "Power off?", NULL, NULL, power_opts_battery, 3, prompt_choice);
-      }
-      else if (prompt == PROMPT_LAUNCH_TIP)
-         draw_prompt4(dc, "Tip: sleep while you play", "Tap the Power button twice to put the handheld to sleep.",
-               "Hold it for 3 seconds to save and power off.",
-               "Heads up: sleeping can turn off ADB until you restart,",
-               "and a game may crash when it wakes (it saves first).", tip_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_SLEEP)
-         draw_prompt(dc, "Sleep?", "Press Power to wake. In a game this isn't real sleep:",
-               "it saves a state, then loads it back when you wake.", sleep_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_USB)
-         draw_prompt(dc, "Computer connected", "Allow file transfer? Both drives will show up on the",
-               "computer, and you can keep playing while it's on.", usb_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_CORE)
-         draw_picker(c);
-      else if (prompt == PROMPT_ERROR)
-         draw_prompt(dc, err_title, err_line1, err_line2, ok_opts, 1, prompt_choice);
-      else if (prompt == PROMPT_BIOS)
-         draw_prompt(dc, err_title, err_line1, err_line2, pending.sleep ? sleep_state_opts : bios_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_THEME_RESET)
-         draw_prompt(dc, "Reset to the default colours?", "Every colour goes back to how the menu came,",
-               "including any you've changed.", reset_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_SET_DEFAULTS)
-         draw_prompt(dc, "Restore the default settings?", "Brightness, volume, the timers, the battery limits",
-               "and the rest go back to how they came.", restore_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_PIC_DELETE)
-         draw_prompt(dc, "Delete this picture?", "It's removed from the card for good,",
-               "along with its prompt.", delete_opts, 2, prompt_choice);
-      else if (prompt == PROMPT_RESET)
-         draw_prompt(dc, "Reset all watch progress?", "Every folder forgets which video you were on",
-               "and where you stopped, and starts from the first.", reset_opts, 2, prompt_choice);
-      if (show_controls)
-         draw_controls(c);
-      else if (prompt == PROMPT_CORE_HOW)
-      {
-         char title[96], note[160];
-         snprintf(title, sizeof(title), "Use %s", core_title(pick.cores[pick.sel]));
-         snprintf(note, sizeof(note), "or for every %s game?", systems[pick.sys].name);
-         draw_prompt(dc, title, "Just this once, always for this game,", note, how_opts, 3, prompt_choice);
-      }
-      else if (prompt == PROMPT_BATTERY)
-      {
-         char title[48], note[96];
-         snprintf(title, sizeof(title), "Battery low: %d%%", bat_level);
-         snprintf(note, sizeof(note), "it saves and powers off by itself at %d%%.",
-               setting_int("battery_off_percent", 10));
-         draw_prompt(dc, title, "Plug in a charger soon. If you keep playing,", note,
-               ok_opts, 1, prompt_choice);
+         /* the still part of a prompt is drawn once and kept (frozen_save); after that only what moves is drawn */
+         int pass = use_frozen ? 2 : freezable && !busy ? 1 : 0;
+         for (;;)
+         {
+            prompt_phase = pass;
+            if (prompt == PROMPT_POWER)
+            {
+               if (power_restart)
+                  draw_prompt(dc, "Power off?", NULL, NULL, power_opts, 4, prompt_choice);
+               else
+                  draw_prompt(dc, "Power off?", NULL, NULL, power_opts_battery, 3, prompt_choice);
+            }
+            else if (prompt == PROMPT_LAUNCH_TIP)
+               draw_prompt_toggle(dc, "Tip: sleep while you play", "Tap the Power button twice to put the handheld to sleep.",
+                     "Hold it for 3 seconds to save and power off.",
+                     "Heads up: sleeping can turn off ADB until you restart,",
+                     "and a game may crash when it wakes (it saves first).", "Don't show these tips again", "Play", prompt_choice, t);
+            else if (prompt == PROMPT_SLEEP)
+               draw_prompt(dc, "Sleep?", "Press Power to wake. In a game this isn't real sleep:",
+                     "it saves a state, then loads it back when you wake.", sleep_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_USB)
+               draw_prompt(dc, "Computer connected", "Allow file transfer? Both drives will show up on the",
+                     "computer, and you can keep playing while it's on.", usb_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_CORE)
+               draw_picker(c);
+            else if (prompt == PROMPT_ERROR)
+               draw_prompt(dc, err_title, err_line1, err_line2, ok_opts, 1, prompt_choice);
+            else if (prompt == PROMPT_BIOS && pending.psx && !pending.sleep)
+               draw_prompt_toggle(dc, err_title, "They aren't analog. They're digital, and send the same", "inputs as the D-pad and the A, B, X, Y buttons,",
+                     "so games that need two analog sticks can't be", "played properly. We know of no way to separate them.",
+                     "Don't show this again", "Play", prompt_choice, t);
+            else if (prompt == PROMPT_BIOS)
+               draw_prompt(dc, err_title, err_line1, err_line2, pending.sleep ? sleep_state_opts : bios_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_THEME_RESET)
+               draw_prompt(dc, "Reset to the default colours?", "Every colour goes back to how the menu came,",
+                     "including any you've changed.", reset_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_SET_DEFAULTS)
+               draw_prompt(dc, "Restore the default settings?", "Brightness, volume, the timers, the battery limits",
+                     "and the rest go back to how they came.", restore_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_PIC_DELETE)
+               draw_prompt(dc, "Delete this picture?", "It's removed from the card for good,",
+                     "along with its prompt.", delete_opts, 2, prompt_choice);
+            else if (prompt == PROMPT_RESET)
+               draw_prompt(dc, "Reset all watch progress?", "Every folder forgets which video you were on",
+                     "and where you stopped, and starts from the first.", reset_opts, 2, prompt_choice);
+            if (show_controls)
+               draw_controls(c);
+            else if (prompt == PROMPT_CORE_HOW)
+            {
+               char title[96], note[160];
+               snprintf(title, sizeof(title), "Use %s", core_title(pick.cores[pick.sel]));
+               snprintf(note, sizeof(note), "or for every %s game?", systems[pick.sys].name);
+               draw_prompt(dc, title, "Just this once, always for this game,", note, how_opts, 3, prompt_choice);
+            }
+            else if (prompt == PROMPT_BATTERY)
+            {
+               char title[48], note[96];
+               snprintf(title, sizeof(title), "Battery low: %d%%", bat_level);
+               snprintf(note, sizeof(note), "it saves and powers off by itself at %d%%.",
+                     setting_int("battery_off_percent", 10));
+               draw_prompt(dc, title, "Plug in a charger soon. If you keep playing,", note,
+                     ok_opts, 1, prompt_choice);
+            }
+            if (pass == 1)
+            {
+               frozen_save(dc, fkey, t);
+               pass = 2;
+               continue;
+            }
+            break;
+         }
+         prompt_phase = 0;
       }
       if (want_shot)
       {
@@ -10886,9 +15366,24 @@ run:
          save_shot(dc);
       }
       if (video_mode)
+      {
+         frame_forget();
+         same_frames = 0;
          gfx_video_end();
+      }
       else
-         gfx_present();
+      {
+         /* a frame like the last one needn't be shown again (unless something is moving: then the page flip sets the pace) */
+         if (frame_changed(dc) || busy || !screen_on)
+         {
+            same_frames = 0;
+            gfx_present();
+            if (!screen_on)
+               frame_forget();   /* (the screen comes back with a frame shown) */
+         }
+         else
+            same_frames++;
+      }
    }
 
    media_stop(1);

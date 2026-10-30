@@ -29,7 +29,7 @@ No games, BIOS files or box art are included. Bring your own.
 
 ## Installing
 
-1. Download `g36-firmware-v1.0.img` from the [Releases](../../releases) page.
+1. Download `g36-firmware-v1.1.img` from the [Releases](../../releases) page.
 2. Flash it to a microSD card with [balenaEtcher](https://etcher.balena.io) (cards from 4 GB up to 2 TB; 64 GB and
    256 GB cards have been tested). This erases the card.
 3. Put the card in the handheld and switch it on. The first start takes a few minutes: it creates and formats a games

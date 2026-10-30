@@ -1,0 +1,574 @@
+--- oga_gfx.c.osd	2026-10-26 10:01:55
++++ oga_gfx.c	2026-10-26 10:19:36
+@@ -40,10 +40,15 @@
+ 
+ #include "../font_driver.h"
+ #include <unistd.h>
++#include <time.h>
+ 
+ #include "../../configuration.h"
+ #include "../../retroarch.h"
+ #include "../../verbosity.h"
++#ifdef HAVE_OVERLAY
++#include <formats/image.h>
++#include "../../input/input_overlay.h"
++#endif
+ 
+ /* G36 (RK3506): this RGA reads libretro RGB565 frames with red/blue swapped
+  * when tagged RK_FORMAT_RGB_565, so 16-bit frames are tagged BGR_565 instead. */
+@@ -83,6 +88,33 @@
+    uint32_t fb_id;
+ } oga_framebuf_t;
+ 
++
++#ifdef HAVE_OVERLAY
++/* G36: overlays (RetroArch's own overlay files). Only the parts of an overlay image that
++ * are not fully transparent are drawn, as a few rectangles, so a frame of side bars costs
++ * two small RGA blits. Opaque rectangles are copied, the rest are blended. */
++#define OGA_OV_MAX_RECTS 24
++
++typedef struct oga_ov_rect
++{
++   int x;
++   int y;
++   int w;
++   int h;
++   bool opaque;
++} oga_ov_rect_t;
++
++typedef struct oga_overlay
++{
++   oga_surface_t *surface;
++   int nrects;
++   oga_ov_rect_t rects[OGA_OV_MAX_RECTS];
++   float vx, vy, vw, vh;   /* where it goes, 0..1 of the screen (or of the game picture) */
++   float tx, ty, tw, th;   /* which part of the image, 0..1 */
++   float alpha;
++} oga_overlay_t;
++#endif
++
+ typedef struct oga_video
+ {
+    drmModeModeInfo mode;
+@@ -109,8 +141,24 @@
+    char osd_msg[96];
+    unsigned osd_tick;
+    unsigned osd_left;
++   /* G36: a backdrop for the screen's bars, painted by g36menu into /tmp/g36-bezel.raw */
++   oga_surface_t *bezel;
++   /* G36: where the frame time goes (microseconds, summed over 600 frames; verbose log only) */
++   unsigned t_frames;
++   uint64_t t_total, t_overlay, t_flip;
++#ifdef HAVE_OVERLAY
++   oga_overlay_t *overlays;
++   unsigned overlay_count;
++   bool overlay_enable;
++   bool overlay_full;
++   oga_rect_t game_rect;
++#endif
+ } oga_video_t;
+ 
++#ifdef HAVE_OVERLAY
++static void oga_overlay_free(oga_video_t *vid);
++#endif
++
+ static bool oga_create_display(oga_video_t* vid)
+ {
+    int i, ret;
+@@ -337,6 +385,11 @@
+    for (i = 0; i < NUM_PAGES; ++i)
+       oga_destroy_framebuf(vid->pages[i]);
+ 
++#ifdef HAVE_OVERLAY
++   oga_overlay_free(vid);
++#endif
++   if (vid->bezel)
++      oga_destroy_surface(vid->bezel);
+    oga_destroy_surface(vid->frame_surface);
+    oga_destroy_surface(vid->msg_surface);
+    oga_destroy_surface(vid->menu_surface);
+@@ -347,6 +400,54 @@
+    vid = NULL;
+ }
+ 
++
++/* G36: /tmp/g36-bezel.raw is written by g36menu just before a game starts: "G36B", width, height, 4 spare
++ * bytes, then width*height 0xAARRGGBB pixels. If it's there and as big as the screen it becomes the backdrop
++ * around the game picture (everything the picture doesn't cover) instead of black. */
++static oga_surface_t *oga_bezel_load(oga_video_t *vid)
++{
++   uint32_t head[4];
++   oga_surface_t *surface = NULL;
++   FILE *f = fopen("/tmp/g36-bezel.raw", "rb");
++   int y;
++
++   if (!f)
++      return NULL;
++   if (fread(head, sizeof(head), 1, f) != 1 || head[0] != 0x42363347u
++         || head[1] != (uint32_t)vid->drm_width || head[2] != (uint32_t)vid->drm_height)
++      goto out;
++   if (!(surface = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, OGA_FMT_32)))
++      goto out;
++   for (y = 0; y < vid->drm_height; y++)
++      if (fread(surface->map + (size_t)y * surface->pitch, 4, vid->drm_width, f) != (size_t)vid->drm_width)
++      {
++         oga_destroy_surface(surface);
++         surface = NULL;
++         break;
++      }
++out:
++   fclose(f);
++   if (surface)
++      RARCH_LOG("[oga] Border backdrop loaded from /tmp/g36-bezel.raw.\n");
++   return surface;
++}
++
++static void rga_fill_rect(oga_surface_t* surface, int x, int y, int w, int h, int color)
++{
++   rga_info_t dst   = { 0 };
++   dst.fd           = surface->prime_fd;
++   dst.mmuFlag      = 1;
++   dst.rect.xoffset = x;
++   dst.rect.yoffset = y;
++   dst.rect.width   = w;
++   dst.rect.height  = h;
++   dst.rect.wstride = surface->width;
++   dst.rect.hstride = surface->height;
++   dst.rect.format  = surface->rk_format;
++   dst.color        = color;
++   c_RkRgaColorFill(&dst);
++}
++
+ static void *oga_init(const video_info_t *video,
+       input_driver_t **input, void **input_data)
+ {
+@@ -408,6 +509,7 @@
+    vid->frame_surface = oga_create_surface(vid->fd, geom->max_width, geom->max_height, video->rgb32 ? OGA_FMT_32 : OGA_FMT_565);
+    vid->msg_surface   = oga_create_surface(vid->fd, vid->drm_width, vid->drm_height, OGA_FMT_32);
+    vid->last_msg[0]   = 0;
++   vid->bezel         = oga_bezel_load(vid);
+ 
+    /* bitmap only for now */
+    if (settings->bools.video_font_enable)
+@@ -592,7 +694,336 @@
+       r->h = MIN(dh, (dw / aspect + 0.5));
+       r->x = 0;
+       r->y = (int)((dh - r->h) / 2) + 0.5;
++   }
++}
++
++
++#ifdef HAVE_OVERLAY
++static void oga_overlay_free(oga_video_t *vid)
++{
++   unsigned i;
++   for (i = 0; i < vid->overlay_count; i++)
++      if (vid->overlays[i].surface)
++         oga_destroy_surface(vid->overlays[i].surface);
++   free(vid->overlays);
++   vid->overlays      = NULL;
++   vid->overlay_count = 0;
++}
++
++/* Work out which rectangles of an overlay image have anything in them (alpha above 0):
++ * each row's runs of non-transparent pixels, joined with the identical run in the row
++ * above. More than OGA_OV_MAX_RECTS of them (a busy picture) -> one rectangle for it all. */
++static void oga_overlay_scan(oga_overlay_t *o, const uint32_t *px, int w, int h)
++{
++   typedef struct { int x0, x1, y0; bool used; } run_t;
++   run_t prev[OGA_OV_MAX_RECTS], cur[OGA_OV_MAX_RECTS];
++   int nprev = 0, y, i, j;
++   bool overflow = false;
++
++   o->nrects = 0;
++
++   for (y = 0; y <= h && !overflow; y++)
++   {
++      int ncur = 0;
++
++      if (y < h)
++      {
++         const uint32_t *row = px + (size_t)y * w;
++         int x = 0;
++         while (x < w)
++         {
++            int start;
++            while (x < w && (row[x] >> 24) == 0)
++               x++;
++            if (x >= w)
++               break;
++            start = x;
++            while (x < w && (row[x] >> 24) != 0)
++               x++;
++            if (ncur == OGA_OV_MAX_RECTS)
++            {
++               overflow = true;
++               break;
++            }
++            cur[ncur].x0   = start;
++            cur[ncur].x1   = x;
++            cur[ncur].y0   = y;
++            cur[ncur].used = false;
++            ncur++;
++         }
++      }
++
++      /* runs that continue the previous row's keep its start row; the others are finished */
++      for (i = 0; i < nprev && !overflow; i++)
++      {
++         for (j = 0; j < ncur; j++)
++            if (!cur[j].used && cur[j].x0 == prev[i].x0 && cur[j].x1 == prev[i].x1)
++               break;
++         if (j < ncur)
++         {
++            cur[j].used = true;
++            cur[j].y0   = prev[i].y0;
++         }
++         else if (o->nrects == OGA_OV_MAX_RECTS)
++            overflow = true;
++         else
++         {
++            oga_ov_rect_t *r = &o->rects[o->nrects++];
++            r->x = prev[i].x0;
++            r->y = prev[i].y0;
++            r->w = prev[i].x1 - prev[i].x0;
++            r->h = y - prev[i].y0;
++         }
++      }
++
++      memcpy(prev, cur, sizeof(run_t) * ncur);
++      nprev = ncur;
++   }
++
++   if (overflow)
++   {
++      o->nrects  = 1;
++      o->rects[0].x = 0;
++      o->rects[0].y = 0;
++      o->rects[0].w = w;
++      o->rects[0].h = h;
++   }
++
++   /* a rectangle with no see-through pixel in it can be copied instead of blended */
++   for (i = 0; i < o->nrects; i++)
++   {
++      oga_ov_rect_t *r = &o->rects[i];
++      int xx, yy;
++      r->opaque = true;
++      for (yy = r->y; yy < r->y + r->h && r->opaque; yy++)
++         for (xx = r->x; xx < r->x + r->w; xx++)
++            if ((px[(size_t)yy * w + xx] >> 24) != 0xff)
++            {
++               r->opaque = false;
++               break;
++            }
++   }
++}
++
++static bool oga_overlay_load(void *data, const void *image_data, unsigned num_images)
++{
++   unsigned i;
++   oga_video_t *vid                   = (oga_video_t*)data;
++   const struct texture_image *images = (const struct texture_image*)image_data;
++
++   if (!vid)
++      return false;
++
++   oga_overlay_free(vid);
++
++   vid->overlays = (oga_overlay_t*)calloc(num_images, sizeof(*vid->overlays));
++   if (!vid->overlays)
++      return false;
++   vid->overlay_count = num_images;
++
++   for (i = 0; i < num_images; i++)
++   {
++      oga_overlay_t *o = &vid->overlays[i];
++      int y;
++
++      o->surface = oga_create_surface(vid->fd, images[i].width, images[i].height, OGA_FMT_32);
++      if (!o->surface)
++      {
++         oga_overlay_free(vid);
++         return false;
++      }
++      /* pixels are 0xAARRGGBB, which is how the BGRA surfaces are laid out. The RGA's
++       * blend (0x105) wants the colours already multiplied by alpha, so do that here. */
++      for (y = 0; y < (int)images[i].height; y++)
++      {
++         const uint32_t *in = images[i].pixels + (size_t)y * images[i].width;
++         uint32_t *out      = (uint32_t*)(o->surface->map + (size_t)y * o->surface->pitch);
++         unsigned x;
++         for (x = 0; x < images[i].width; x++)
++         {
++            uint32_t px = in[x];
++            uint32_t a  = px >> 24;
++            if (a == 0xff)
++               out[x] = px;
++            else if (a == 0)
++               out[x] = 0;
++            else
++               out[x] = (a << 24)
++                  | ((((px >> 16) & 0xff) * a / 255) << 16)
++                  | ((((px >> 8) & 0xff) * a / 255) << 8)
++                  | ((px & 0xff) * a / 255);
++         }
++      }
++
++      oga_overlay_scan(o, images[i].pixels, images[i].width, images[i].height);
++      RARCH_LOG("[oga] Overlay image %u: %ux%u, %d rectangle(s) to draw.\n",
++            i, images[i].width, images[i].height, o->nrects);
++
++      o->vx = 0.0f; o->vy = 0.0f; o->vw = 1.0f; o->vh = 1.0f;
++      o->tx = 0.0f; o->ty = 0.0f; o->tw = 1.0f; o->th = 1.0f;
++      o->alpha = 1.0f;
++   }
++   return true;
++}
++
++static void oga_overlay_enable(void *data, bool state)
++{
++   oga_video_t *vid = (oga_video_t*)data;
++   if (vid)
++      vid->overlay_enable = state;
++}
++
++static void oga_overlay_full_screen(void *data, bool enable)
++{
++   oga_video_t *vid = (oga_video_t*)data;
++   if (vid)
++      vid->overlay_full = enable;
++}
++
++static void oga_overlay_tex_geom(void *data, unsigned image, float x, float y, float w, float h)
++{
++   oga_video_t *vid = (oga_video_t*)data;
++   if (!vid || image >= vid->overlay_count)
++      return;
++   vid->overlays[image].tx = x;
++   vid->overlays[image].ty = y;
++   vid->overlays[image].tw = w;
++   vid->overlays[image].th = h;
++}
++
++static void oga_overlay_vertex_geom(void *data, unsigned image, float x, float y, float w, float h)
++{
++   oga_video_t *vid = (oga_video_t*)data;
++   if (!vid || image >= vid->overlay_count)
++      return;
++   vid->overlays[image].vx = x;
++   vid->overlays[image].vy = y;
++   vid->overlays[image].vw = w;
++   vid->overlays[image].vh = h;
++}
++
++static void oga_overlay_set_alpha(void *data, unsigned image, float mod)
++{
++   oga_video_t *vid = (oga_video_t*)data;
++   if (!vid || image >= vid->overlay_count)
++      return;
++   vid->overlays[image].alpha = mod;
++}
++
++/* Draw the overlays on the page (which is the screen turned on its side, like the game). */
++static void oga_overlay_draw(oga_video_t *vid, oga_surface_t *page)
++{
++   unsigned i;
++   int n;
++   const int sw = vid->drm_width;    /* landscape size, as the player sees it */
++   const int sh = vid->drm_height;
++
++   for (i = 0; i < vid->overlay_count; i++)
++   {
++      oga_overlay_t *o = &vid->overlays[i];
++      float bx = 0.0f, by = 0.0f, bw = (float)sw, bh = (float)sh;
++      float dx, dy, dw, dh, iw, ih, fx, fy, tx0, ty0, tx1, ty1;
++      unsigned blend_global;
++
++      if (!o->surface || o->alpha <= 0.0f || o->tw <= 0.0f || o->th <= 0.0f)
++         continue;
++
++      if (!vid->overlay_full)
++      {
++         bx = (float)vid->game_rect.x;
++         by = (float)vid->game_rect.y;
++         bw = (float)vid->game_rect.w;
++         bh = (float)vid->game_rect.h;
++      }
++
++      dx = bx + o->vx * bw;
++      dy = by + o->vy * bh;
++      dw = o->vw * bw;
++      dh = o->vh * bh;
++      iw = (float)o->surface->width;
++      ih = (float)o->surface->height;
++      fx = dw / (o->tw * iw);
++      fy = dh / (o->th * ih);
++      tx0 = o->tx * iw;  tx1 = tx0 + o->tw * iw;
++      ty0 = o->ty * ih;  ty1 = ty0 + o->th * ih;
++      blend_global = (unsigned)(o->alpha * 255.0f + 0.5f);
++      if (blend_global > 255)
++         blend_global = 255;
++
++      for (n = 0; n < o->nrects; n++)
++      {
++         const oga_ov_rect_t *r = &o->rects[n];
++         float cx0 = (float)r->x, cy0 = (float)r->y;
++         float cx1 = (float)(r->x + r->w), cy1 = (float)(r->y + r->h);
++         int lx0, ly0, lx1, ly1;       /* destination, landscape */
++         int sx, sy, sxw, syh;          /* source */
++         unsigned blend;
++
++         /* the part of the rectangle inside the image window being shown */
++         if (cx0 < tx0) cx0 = tx0;
++         if (cy0 < ty0) cy0 = ty0;
++         if (cx1 > tx1) cx1 = tx1;
++         if (cy1 > ty1) cy1 = ty1;
++         if (cx1 <= cx0 || cy1 <= cy0)
++            continue;
++
++         lx0 = (int)(dx + (cx0 - tx0) * fx + 0.0f);
++         ly0 = (int)(dy + (cy0 - ty0) * fy + 0.0f);
++         lx1 = (int)(dx + (cx1 - tx0) * fx + 0.999f);
++         ly1 = (int)(dy + (cy1 - ty0) * fy + 0.999f);
++         /* keep it on the screen */
++         if (lx0 < 0) lx0 = 0;
++         if (ly0 < 0) ly0 = 0;
++         if (lx1 > sw) lx1 = sw;
++         if (ly1 > sh) ly1 = sh;
++         if (lx1 <= lx0 || ly1 <= ly0)
++            continue;
++
++         sx  = (int)cx0;
++         sy  = (int)cy0;
++         sxw = (int)(cx1 + 0.999f) - sx;
++         syh = (int)(cy1 + 0.999f) - sy;
++         if (sx + sxw > (int)o->surface->width)  sxw = (int)o->surface->width - sx;
++         if (sy + syh > (int)o->surface->height) syh = (int)o->surface->height - sy;
++         if (sxw <= 0 || syh <= 0)
++            continue;
++
++         blend = (r->opaque && blend_global == 255) ? 0 : ((blend_global << 16) | 0x105);
++
++         /* landscape (x, y) -> page (y, sw - x), as for the game (rotation 270) */
++         oga_blit(o->surface, sx, sy, sxw, syh,
++               page, ly0, sw - lx1, ly1 - ly0, lx1 - lx0,
++               HAL_TRANSFORM_ROT_270, vid->scale_mode, blend);
++      }
+    }
++}
++
++static const video_overlay_interface_t oga_overlay_interface = {
++   oga_overlay_enable,
++   oga_overlay_load,
++   oga_overlay_tex_geom,
++   oga_overlay_vertex_geom,
++   oga_overlay_full_screen,
++   oga_overlay_set_alpha,
++};
++
++static void oga_get_overlay_interface(void *data, const video_overlay_interface_t **iface)
++{
++   *iface = &oga_overlay_interface;
++}
++#endif
++
++
++/* a piece of the backdrop: landscape rectangle (x, y, w, h), same mapping as the game and the overlays */
++static void oga_bezel_strip(oga_video_t *vid, oga_surface_t *page, int x, int y, int w, int h)
++{
++   if (x < 0) { w += x; x = 0; }
++   if (y < 0) { h += y; y = 0; }
++   if (x + w > vid->drm_width)  w = vid->drm_width - x;
++   if (y + h > vid->drm_height) h = vid->drm_height - y;
++   if (w < 2 || h < 2)
++      return;
++   oga_blit(vid->bezel, x, y, w, h, page, y, vid->drm_width - x - w, h, w, HAL_TRANSFORM_ROT_270, vid->scale_mode, 0);
+ }
+ 
+ static bool oga_frame(void *data, const void *frame, unsigned width,
+@@ -607,6 +1038,9 @@
+    bool menu_is_alive = (video_info->menu_st_flags & MENU_ST_FLAG_ALIVE) ? true : false;
+ #endif
+ 
++   struct timespec ts0, ts1, ts2, ts3;
++   clock_gettime(CLOCK_MONOTONIC, &ts0);
++
+    if (unlikely(!frame || width == 0 || height == 0))
+       return true;
+ 
+@@ -665,7 +1099,12 @@
+             msg = NULL;
+    }
+ 
+-   rga_clear_surface(page_surface, 0);
++#ifdef HAVE_MENU
++   if (!vid->bezel || menu_is_alive)
++#else
++   if (!vid->bezel)
++#endif
++      rga_clear_surface(page_surface, 0);
+ 
+ #ifdef HAVE_MENU
+    if (menu_is_alive)
+@@ -704,8 +1143,29 @@
+       }
+ 
+       oga_calc_bounds(&r, vid->drm_width, vid->drm_height, width, height, aspect_ratio, vid->display_ar);
++      /* the game is drawn at page (r.y, r.x), which is landscape x = screen width - r.x - r.w */
++      r.x = vid->drm_width - r.x - r.w;
++      if (vid->bezel)
++      {
++         /* the backdrop around the picture (a little under it too, the picture is drawn over that) */
++         oga_bezel_strip(vid, page_surface, 0, 0, r.x + 2, vid->drm_height);
++         oga_bezel_strip(vid, page_surface, r.x + r.w - 2, 0, vid->drm_width - (r.x + r.w) + 2, vid->drm_height);
++         oga_bezel_strip(vid, page_surface, r.x, 0, r.w, r.y + 2);
++         oga_bezel_strip(vid, page_surface, r.x, r.y + r.h - 2, r.w, vid->drm_height - (r.y + r.h) + 2);
++         /* a paused game is drawn dimmed over what's there, which must be black */
++         if (blend)
++            rga_fill_rect(page_surface, r.y, vid->drm_width - r.x - r.w, r.h, r.w, 0);
++      }
+       oga_blit(vid->frame_surface, 0, 0, width, height,
+-            page_surface, r.y, r.x, r.h, r.w, vid->rotation, vid->scale_mode, blend);
++            page_surface, r.y, vid->drm_width - r.x - r.w, r.h, r.w, vid->rotation, vid->scale_mode, blend);
++#ifdef HAVE_OVERLAY
++      vid->game_rect = r;
++      clock_gettime(CLOCK_MONOTONIC, &ts1);
++      if (vid->overlay_enable && vid->overlay_count)
++         oga_overlay_draw(vid, page_surface);
++      clock_gettime(CLOCK_MONOTONIC, &ts2);
++      vid->t_overlay += (ts2.tv_sec - ts1.tv_sec) * 1000000ull + (ts2.tv_nsec - ts1.tv_nsec) / 1000;
++#endif
+    }
+ 
+    if (msg)
+@@ -715,8 +1175,20 @@
+             HAL_TRANSFORM_ROT_270, vid->scale_mode, 0xff0105);
+    }
+ 
++   clock_gettime(CLOCK_MONOTONIC, &ts2);
+    if (unlikely(drmModeSetCrtc(vid->fd, vid->crtc_id, page->fb_id, 0, 0, &vid->connector_id, 1, &vid->mode) != 0))
+       RARCH_ERR("drmModeSetCrtc failed.\n");
++   clock_gettime(CLOCK_MONOTONIC, &ts3);
++   vid->t_flip  += (ts3.tv_sec - ts2.tv_sec) * 1000000ull + (ts3.tv_nsec - ts2.tv_nsec) / 1000;
++   vid->t_total += (ts3.tv_sec - ts0.tv_sec) * 1000000ull + (ts3.tv_nsec - ts0.tv_nsec) / 1000;
++   if (++vid->t_frames == 600)
++   {
++      RARCH_LOG("[oga] per frame over 600: %llu us in total, %llu us overlay, %llu us waiting in the flip.\n",
++            (unsigned long long)(vid->t_total / 600), (unsigned long long)(vid->t_overlay / 600),
++            (unsigned long long)(vid->t_flip / 600));
++      vid->t_frames = 0;
++      vid->t_total = vid->t_overlay = vid->t_flip = 0;
++   }
+ 
+    vid->cur_page = (vid->cur_page + 1) % NUM_PAGES;
+ 
+@@ -884,7 +1356,7 @@
+    NULL, /* read_viewport */
+    NULL, /* read_frame_raw */
+ #ifdef HAVE_OVERLAY
+-   NULL, /* get_overlay_interface */
++   oga_get_overlay_interface,
+ #endif
+    oga_get_poke_interface,
+    NULL, /* wrap_type_to_enum */

@@ -289,6 +289,15 @@ static void present_page(dumb_t *page)
 
 void gfx_screen_power(int on)
 {
+   if (!on && d.canvas.px && d.crtc_set)
+   {
+      /* a few black frames first, so the panel doesn't keep (and the glass doesn't seem to hold) the last picture while it powers down */
+      int i;
+      memset(d.canvas.px, 0, (size_t)d.canvas.stride * 4 * d.canvas.h);
+      for (i = 0; i < 3; i++)
+         gfx_present();
+      flip_wait();
+   }
    if (d.dpms_prop)
       drmModeConnectorSetProperty(d.fd, d.conn_id, d.dpms_prop, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
 }
@@ -461,9 +470,12 @@ void gfx_video_end(void)
 static inline uint32_t blend(uint32_t dst, uint32_t src, unsigned a)
 {
    unsigned ia = 255 - a;
-   unsigned r = (((src >> 16) & 0xff) * a + ((dst >> 16) & 0xff) * ia) / 255;
-   unsigned g = (((src >> 8) & 0xff) * a + ((dst >> 8) & 0xff) * ia) / 255;
-   unsigned b = ((src & 0xff) * a + (dst & 0xff) * ia) / 255;
+   unsigned r = ((src >> 16) & 0xff) * a + ((dst >> 16) & 0xff) * ia + 128;
+   unsigned g = ((src >> 8) & 0xff) * a + ((dst >> 8) & 0xff) * ia + 128;
+   unsigned b = (src & 0xff) * a + (dst & 0xff) * ia + 128;
+   r = (r + (r >> 8)) >> 8;                         /* x / 255, rounded, without a divide */
+   g = (g + (g >> 8)) >> 8;
+   b = (b + (b >> 8)) >> 8;
    return 0xff000000u | (r << 16) | (g << 8) | b;
 }
 
@@ -892,7 +904,13 @@ static int draw_run(canvas_t *c, font_t *f, const char *s, const char *end, int 
             int cx = pen + g->left + i;
             unsigned cov = g->bitmap[j * g->w + i];
             if (cov && cx >= 0 && cx < c->w)
-               row[cx] = blend(row[cx], color, cov * (color >> 24) / 255);
+            {
+               unsigned al = (color >> 24) == 255 ? cov : (cov * (color >> 24) + 127) / 255;
+               if (al == 255)
+                  row[cx] = 0xff000000u | (color & 0xffffff);      /* full ink: no blend */
+               else
+                  row[cx] = blend(row[cx], color, al);
+            }
          }
       }
       pen += g->advance;

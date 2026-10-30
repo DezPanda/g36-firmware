@@ -16,6 +16,40 @@ static const char *names[] = { "Chbp", "gpio-keys", "adc-keys" };
 
 static int fds[NDEV] = { -1, -1, -1 };
 static unsigned char held[KEY_MAX + 1];
+static short xlate[KEY_MAX + 1];   /* real button -> the one the menu is told about */
+static int xlate_on, raw_mode;
+
+static const int fn_codes[9] = { BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_SELECT, BTN_START, KEY_MENU };
+
+void input_set_map(const int *real)
+{
+   int i, k, seen = 0;
+   xlate_on = 0;
+   if (!real)
+      return;
+   for (i = 0; i <= KEY_MAX; i++)
+      xlate[i] = (short)i;
+   for (k = 0; k < 9; k++)
+   {
+      int j, ok = 0;
+      for (j = 0; j < 9; j++)
+         if (real[k] == fn_codes[j] && !(seen >> j & 1))
+         {
+            seen |= 1 << j;
+            ok = 1;
+         }
+      if (!ok)
+         return;                                      /* not a good map: leave the buttons as they are */
+      xlate[real[k]] = (short)fn_codes[k];
+      if (real[k] != fn_codes[k])
+         xlate_on = 1;
+   }
+}
+
+void input_set_raw(int raw)
+{
+   raw_mode = raw;
+}
 
 static int open_by_name(const char *want)
 {
@@ -63,7 +97,7 @@ int input_next(key_event_t *ev, int timeout_ms)
             if (e.type != EV_KEY || e.code > KEY_MAX)
                continue;
             held[e.code] = e.value != 0;
-            ev->code  = e.code;
+            ev->code  = xlate_on && !raw_mode ? xlate[e.code] : e.code;
             ev->value = e.value;
             return 1;
          }
